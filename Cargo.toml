@@ -7,7 +7,7 @@ default-members = ["apps/sideward-cli"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/ksotox/LLMModel"
+repository = "https://github.com/ksotox/sideward"
 
 [workspace.dependencies]
 sideward-core = { path = "crates/sideward-core" }
@@ -23,3 +23,6 @@ plist = "1.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[profile.release]
+strip = true

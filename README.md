@@ -8,7 +8,8 @@ Sideward ships as a desktop app (`sideward-gui`) and a command-line tool (`sidew
 
 - **Apple ID login that works in 2026.** In October 2026 Apple started rejecting Android-emulated anisette data, which shows up as `Login failed (-80045/-80046): This action cannot be completed at this time`. Sideward uses the same fix as iloader 2.4: Mac-emulating anisette servers, with the client info fetched from the server. If Apple rejects one server, it switches to the next automatically.
 - **Wi-Fi without iTunes.** Plug in once and run `wifi setup`. After that, Sideward finds the device on your network over Bonjour and installs over plain TCP using the saved pairing file. Neither usbmuxd nor iTunes has to see the device. Wi-Fi sync through iTunes/Finder (usbmuxd) works too.
-- **Auto-refresh.** Free Apple IDs sign apps for 7 days. Sideward remembers what it installed, keeping a copy of the IPA and any tweaks, and `sideward daemon` re-signs apps before they expire, over Wi-Fi or USB.
+- **AutoRefresh when a device connects.** Free Apple IDs sign apps for 7 days. Sideward remembers what it installed, keeping a copy of the IPA and any tweaks. Whenever a device is plugged in or shows up on Wi-Fi, it re-signs that device's apps before the 7 days run out, and the apps keep their data. You can turn this on or off per app, like Sideloadly's AutoRefresh.
+- **Starts with your computer and stays signed in.** Sideward can launch at login and wait in the tray (minimized on Linux), and it keeps you signed in until your Apple ID password changes or Apple asks you to sign in again.
 - **Sideloadly's advanced options:** change name, bundle ID, version, or minimum iOS; enable file sharing; remove device restrictions, extensions, or the Watch app; inject tweaks (`.dylib`, `.framework`, `.bundle`, rootful or rootless `.deb`).
 - **Safety checks.** It refuses encrypted App Store IPAs up front, and when your account hits its certificate limit it asks which certificate to revoke.
 
@@ -31,12 +32,19 @@ Platform notes:
 
 ## Desktop app
 
-Run `sideward-gui`, sign in, pick a device, and drop an `.ipa` onto the window. When a USB device is selected, **Enable Wi-Fi installs** sets it up for wireless installs. The **My apps** tab shows when each app expires and refreshes them.
+Run `sideward-gui`, sign in, pick a device, and drop an `.ipa` onto the window. When a USB device is selected, **Enable Wi-Fi installs** sets it up for wireless installs.
+
+- **My apps** lists each installed app, when it expires, and an **AutoRefresh** switch.
+- **Settings → AutoRefresh** sets when apps are re-signed: when fewer than N days are left (default 3), or with 7, every time the device connects (at most every 12 hours per app).
+- **Settings → Startup**: **Start Sideward when I sign in to this computer** (Windows: the Run registry key, no admin needed; macOS: a launch agent; Linux: an XDG autostart entry). Started this way it opens straight to the tray.
+- On Windows and macOS, closing the window keeps Sideward running in the tray so AutoRefresh keeps working. Right-click the tray icon for **Re-sign apps now** or **Quit Sideward**. You can turn this off in Settings. Linux has no tray: started at login, Sideward opens minimized, and closing the window quits.
+- **Stay signed in** is on by default: the password goes to the OS keychain after the first successful sign-in, and Sideward signs in by itself at startup. If Apple rejects the saved password (it was changed) or asks for a 2FA code, the window pops up and asks. **Sign out** forgets the password.
+- Only one copy runs at a time; opening Sideward again brings the running window forward.
 
 ## Command line
 
 ```sh
-sideward login --save-password          # Apple ID; password goes to the OS keychain
+sideward login                          # Apple ID; you stay signed in (OS keychain) until the password changes
 sideward devices                        # USB, Wi-Fi (usbmuxd), and Wi-Fi (direct)
 sideward install YouTube.ipa            # sign + install to the only/best device
 sideward install App.ipa -d "My iPhone" --wifi
@@ -82,10 +90,14 @@ Tweaks built against CydiaSubstrate need a substrate framework in the app; injec
 ```sh
 sideward apps list                      # what's installed and when it expires
 sideward refresh                        # re-sign apps expiring within 2 days
-sideward daemon --interval-hours 6      # keep doing that in the background
+sideward daemon                         # AutoRefresh: re-sign whenever a device connects
+sideward apps auto-refresh YouTube off  # per-app switch
+sideward auto-refresh days 3            # re-sign when fewer than 3 days are left (7 = every connect)
 ```
 
-The daemon logs in with the saved password (`login --save-password`, or `SIDEWARD_PASSWORD`). Apps keep their data when refreshed.
+The daemon watches for devices plugging in over USB (instantly) and saved Wi-Fi devices appearing on the network (every 5 minutes). It also checks devices that stay connected once an hour. It signs in with the saved password, or `SIDEWARD_PASSWORD`. Apps keep their data when refreshed. Pass `--no-save-password` to any command to sign in without saving the password, and run `sideward logout` to forget it.
+
+Apps installed with Sideloadly itself can't be re-signed, because Sideward needs the original IPA. Install them once with Sideward and they're tracked from then on.
 
 ### Account housekeeping
 
@@ -108,7 +120,7 @@ sideward anisette list | sideward anisette set ani3.stikstore.app
 
 ## Where data lives
 
-The platform data directory (`%APPDATA%\sideward`, `~/Library/Application Support/dev.sideward.Sideward`, or `~/.local/share/sideward`), overridable with `SIDEWARD_HOME`. It holds anisette state per server, the signing key and certificate, pairing files, and copies of remembered apps. Passwords are only stored in the OS keychain.
+The platform data directory (`%APPDATA%\sideward`, `~/Library/Application Support/dev.sideward.Sideward`, or `~/.local/share/sideward`), overridable with `SIDEWARD_HOME`. It holds anisette state per server, the signing key and certificate, pairing files, and copies of remembered apps. Passwords are only stored in the OS keychain (Windows Credential Manager, macOS Keychain, or the Secret Service on Linux).
 
 ## Layout
 

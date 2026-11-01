@@ -18,6 +18,7 @@ pub mod ipa;
 pub mod macho;
 pub mod paths;
 pub mod registry;
+pub mod watch;
 pub mod wifi;
 
 pub use account::{Prompter, Session};

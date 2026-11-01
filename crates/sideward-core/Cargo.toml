@@ -34,6 +34,7 @@ flate2 = "1"
 lzma-rs = "0.3"
 zstd = "0.13"
 walkdir = "2"
+futures-util = "0.3"
 keyring = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust", "vendored"] }
 
 [dev-dependencies]

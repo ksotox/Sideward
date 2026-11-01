@@ -8,7 +8,7 @@ use idevice::{
     lockdown::LockdownClient,
     pairing_file::PairingFile,
     provider::{IdeviceProvider, TcpProvider, UsbmuxdProvider},
-    usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
+    usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection, UsbmuxdDevice},
 };
 use serde::Serialize;
 use tracing::debug;
@@ -214,37 +214,52 @@ async fn list_usbmuxd(filter: TransportFilter) -> Result<Vec<Device>> {
 
     let mut out = Vec::new();
     for d in raw {
-        let (transport, ip) = match d.connection_type {
-            Connection::Usb => (TransportKind::Usb, None),
-            Connection::Network(ip) => (TransportKind::UsbmuxdWifi, Some(ip)),
-            Connection::Unknown(_) => continue,
-        };
-        if !filter.allows(transport) {
-            continue;
+        if let Some(device) = from_usbmuxd(&d, &addr, filter).await {
+            out.push(device);
         }
-        let provider = d.to_provider(addr.clone(), LABEL);
-        // Some lockdownd versions only answer over Wi-Fi inside a session
-        let identity = match read_identity(&provider, false).await {
-            Ok(id) => Ok(id),
-            Err(_) => read_identity(&provider, true).await,
-        };
-        let (name, ios_version) = match identity {
-            Ok((_, name, version)) => (name, Some(version)),
-            Err(e) => {
-                debug!("Could not read info for {}: {e:#}", d.udid);
-                ("Unknown device".to_string(), None)
-            }
-        };
-        out.push(Device {
-            udid: d.udid.clone(),
-            name,
-            ios_version,
-            transport,
-            ip,
-            usbmuxd_id: Some(d.device_id),
-        });
     }
     Ok(out)
+}
+
+/// Describe a usbmuxd device, or `None` if the filter excludes it.
+pub(crate) async fn from_usbmuxd(
+    d: &UsbmuxdDevice,
+    addr: &UsbmuxdAddr,
+    filter: TransportFilter,
+) -> Option<Device> {
+    let (transport, ip) = match d.connection_type {
+        Connection::Usb => (TransportKind::Usb, None),
+        Connection::Network(ip) => (TransportKind::UsbmuxdWifi, Some(ip)),
+        Connection::Unknown(_) => return None,
+    };
+    if !filter.allows(transport) {
+        return None;
+    }
+    let provider = d.to_provider(addr.clone(), LABEL);
+    // Some lockdownd versions only answer over Wi-Fi inside a session
+    let identity = match read_identity(&provider, false).await {
+        Ok(id) => Ok(id),
+        Err(_) => read_identity(&provider, true).await,
+    };
+    let (name, ios_version) = match identity {
+        Ok((_, name, version)) => (name, Some(version)),
+        Err(e) => {
+            debug!("Could not read info for {}: {e:#}", d.udid);
+            ("Unknown device".to_string(), None)
+        }
+    };
+    Some(Device {
+        udid: d.udid.clone(),
+        name,
+        ios_version,
+        transport,
+        ip,
+        usbmuxd_id: Some(d.device_id),
+    })
+}
+
+pub(crate) fn default_usbmuxd_addr() -> Result<UsbmuxdAddr> {
+    usbmuxd_addr()
 }
 
 /// `(udid, name, iOS version)` straight from lockdownd. Over plain TCP lockdownd requires a TLS

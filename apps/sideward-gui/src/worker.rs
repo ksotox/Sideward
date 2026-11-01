@@ -1,7 +1,13 @@
 //! Background thread that owns the tokio runtime and the logged-in session. The UI sends
 //! [`Cmd`]s and receives [`Event`]s, so the window never blocks on the network or a device.
 
-use std::{net::IpAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,11 +20,19 @@ use sideward_core::{
     account::{self, LoginRequest},
     credentials,
     device::{self, Device, DiscoverOptions},
-    install::{self, InstallRequest, Progress, ProgressFn},
+    install::{self, InstallRequest, Progress, ProgressFn, RefreshFilter},
     ipa::{self, AppInfo, AppOptions},
     registry::{self, InstalledApp},
-    wifi,
+    watch, wifi,
 };
+
+/// Log in again after this long; Apple's developer session tokens expire.
+const SESSION_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+/// After an automatic refresh fails on a device, leave it alone for this long.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
+/// How often to re-check devices that stay connected, and to look for Wi-Fi devices.
+const PERIODIC_CHECK: Duration = Duration::from_secs(60 * 60);
+const WIFI_SCAN: Duration = Duration::from_secs(5 * 60);
 use tokio::sync::{mpsc, oneshot};
 
 pub enum Cmd {
@@ -26,7 +40,16 @@ pub enum Cmd {
         apple_id: String,
         /// Empty means "use the saved password".
         password: String,
-        save_password: bool,
+    },
+    /// Forget the saved password and the session.
+    SignOut,
+    /// A device just connected over USB or appeared on Wi-Fi (from the watcher).
+    DeviceConnected(Box<Device>),
+    /// Hourly: re-sign due apps on devices that stayed connected.
+    PeriodicCheck,
+    SetAppAutoRefresh {
+        key: String,
+        enabled: bool,
     },
     Discover,
     SetupWifi {
@@ -87,6 +110,9 @@ pub enum Event {
         team: String,
         server: String,
     },
+    SignedOut,
+    /// Something needs the user (e.g. the saved password stopped working): show the window.
+    Attention,
     Devices(Vec<Device>),
     AppInfo(PathBuf, Result<AppInfo, String>),
     Progress(Progress),
@@ -159,9 +185,10 @@ pub fn spawn(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let worker = Worker::new(paths, out, cmd_tx.clone());
     std::thread::Builder::new()
         .name("sideward-worker".into())
-        .spawn(move || runtime.block_on(Worker::new(paths, out).run(cmd_rx)))?;
+        .spawn(move || runtime.block_on(worker.run(cmd_rx)))?;
     Ok((cmd_tx, evt_rx))
 }
 
@@ -170,17 +197,96 @@ struct Worker {
     config: Config,
     session: Option<Session>,
     out: Outbox,
+    /// For background tasks (device watcher, periodic check) to queue work.
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    failed_at: HashMap<String, Instant>,
 }
 
 impl Worker {
-    fn new(paths: Paths, out: Outbox) -> Self {
+    fn new(paths: Paths, out: Outbox, cmd_tx: mpsc::UnboundedSender<Cmd>) -> Self {
         let config = Config::load(&paths).unwrap_or_default();
         Self {
             paths,
             config,
             session: None,
             out,
+            cmd_tx,
+            failed_at: HashMap::new(),
         }
+    }
+
+    /// Feed connect events and an hourly tick into the command queue, so automatic refreshes
+    /// run one at a time with everything else.
+    fn start_background_tasks(&self) {
+        let (tx, mut connected) = mpsc::unbounded_channel();
+        watch::spawn(self.paths.clone(), WIFI_SCAN, tx);
+        let cmd = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(device) = connected.recv().await {
+                if cmd.send(Cmd::DeviceConnected(Box::new(device))).is_err() {
+                    break;
+                }
+            }
+        });
+        let cmd = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PERIODIC_CHECK);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if cmd.send(Cmd::PeriodicCheck).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Stay signed in: log in with the saved password at startup.
+    async fn sign_in_saved(&mut self) {
+        if !self.config.stay_signed_in || self.config.apple_id.is_none() {
+            return;
+        }
+        self.out.send(Event::Busy(Some("Signing in".into())));
+        if let Err(e) = self.login_saved().await {
+            self.login_failed(e);
+        }
+        self.out.send(Event::Busy(None));
+    }
+
+    async fn login_saved(&mut self) -> Result<bool> {
+        let prompter = Arc::new(GuiPrompter {
+            out: self.out.clone(),
+        });
+        match account::login_saved(&self.paths, &mut self.config, prompter).await? {
+            Some(session) => {
+                self.set_session(session);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn login_failed(&mut self, e: anyhow::Error) {
+        if e.is::<account::SavedPasswordRejected>() {
+            self.out.send(Event::SignedOut);
+            self.out.send(Event::Attention);
+            self.send_config();
+        }
+        self.out.error(e);
+    }
+
+    fn set_session(&mut self, session: Session) {
+        self.out.send(Event::LoggedIn {
+            apple_id: session.apple_id.clone(),
+            team: format!(
+                "{} ({})",
+                session.team.name.as_deref().unwrap_or("Team"),
+                session.team.team_id
+            ),
+            server: session.anisette_server.clone(),
+        });
+        self.session = Some(session);
+        self.send_config();
     }
 
     fn progress(&self) -> ProgressFn {
@@ -211,7 +317,9 @@ impl Worker {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         self.send_config();
         self.send_apps();
+        self.sign_in_saved().await;
         self.discover().await;
+        self.start_background_tasks();
         while let Some(cmd) = rx.recv().await {
             if let Cmd::Pick(kind) = cmd {
                 // File dialogs don't block other work
@@ -220,7 +328,7 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
-                Cmd::Login { .. } => Some("Logging in"),
+                Cmd::Login { .. } => Some("Signing in"),
                 Cmd::Install { .. } => Some("Installing"),
                 Cmd::Export { .. } => Some("Exporting"),
                 Cmd::Refresh { .. } => Some("Refreshing apps"),
@@ -232,7 +340,11 @@ impl Worker {
                 self.out.send(Event::Busy(Some(label.into())));
             }
             if let Err(e) = self.handle(cmd).await {
-                self.out.error(e);
+                if e.is::<account::SavedPasswordRejected>() {
+                    self.login_failed(e);
+                } else {
+                    self.out.error(e);
+                }
             }
             if label.is_some() {
                 self.out.send(Event::Busy(None));
@@ -247,71 +359,161 @@ impl Worker {
         }
     }
 
+    /// A logged-in session, signing in again with the saved password when there's none or
+    /// it's getting old.
     async fn ensure_session(&mut self) -> Result<&mut Session> {
-        if self.session.is_none() {
-            let apple_id = self
-                .config
-                .apple_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Log in with your Apple ID first"))?;
-            self.login(apple_id, String::new(), false).await?;
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|s| s.age() > SESSION_MAX_AGE)
+        {
+            self.session = None;
+            match self.login_saved().await {
+                Ok(true) => {}
+                Ok(false) => anyhow::bail!("Sign in with your Apple ID first"),
+                Err(e) => {
+                    if e.is::<account::SavedPasswordRejected>() {
+                        self.out.send(Event::SignedOut);
+                        self.out.send(Event::Attention);
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(self.session.as_mut().expect("logged in"))
     }
 
-    async fn login(
-        &mut self,
-        apple_id: String,
-        password: String,
-        save_password: bool,
-    ) -> Result<()> {
-        let password = if password.is_empty() {
-            credentials::get_password(&apple_id)?
-                .ok_or_else(|| anyhow::anyhow!("Enter your Apple ID password"))?
+    async fn login(&mut self, apple_id: String, password: String) -> Result<()> {
+        let saved = if password.is_empty() {
+            Some(
+                credentials::get_password(&apple_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Enter your Apple ID password"))?,
+            )
         } else {
-            password
+            None
         };
+        let from_keychain = saved.is_some();
         let prompter = Arc::new(GuiPrompter {
             out: self.out.clone(),
         });
-        let session = account::login(
+        let remember = self.config.stay_signed_in;
+        let session = account::login_and_remember(
             &self.paths,
             &mut self.config,
             LoginRequest {
-                apple_id: apple_id.clone(),
-                password: password.clone(),
+                apple_id,
+                password: saved.unwrap_or(password),
                 anisette_server: None,
             },
+            from_keychain,
+            remember,
             prompter,
         )
         .await?;
-        if save_password && let Err(e) = credentials::save_password(&apple_id, &password) {
-            self.out
-                .send(Event::Log(format!("Couldn't save the password: {e:#}")));
-        }
-        self.out.send(Event::LoggedIn {
-            apple_id: session.apple_id.clone(),
-            team: format!(
-                "{} ({})",
-                session.team.name.as_deref().unwrap_or("Team"),
-                session.team.team_id
-            ),
-            server: session.anisette_server.clone(),
-        });
-        self.session = Some(session);
-        self.send_config();
+        self.set_session(session);
         Ok(())
+    }
+
+    /// Re-sign due apps (AutoRefresh on) on `devices`. Quiet when there's nothing to do.
+    async fn auto_refresh(&mut self, devices: Vec<Device>) -> Result<()> {
+        if !self.config.auto_refresh_on_connect {
+            return Ok(());
+        }
+        let devices: Vec<Device> = devices
+            .into_iter()
+            .filter(|d| {
+                self.failed_at
+                    .get(&d.udid)
+                    .is_none_or(|t| t.elapsed() > FAILURE_BACKOFF)
+            })
+            .collect();
+        let filter = RefreshFilter::Auto(self.config.refresh_policy());
+        let apple_id = self.config.apple_id.clone();
+        let pending =
+            install::pending_refreshes(&self.paths, apple_id.as_deref(), &devices, filter)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = pending.iter().map(|a| a.name.as_str()).collect();
+        self.out.send(Event::Busy(Some(format!(
+            "AutoRefresh: re-signing {}",
+            names.join(", ")
+        ))));
+        let result = self.run_refresh(&devices, filter).await;
+        self.out.send(Event::Busy(None));
+        if let Ok(failed) = &result {
+            for udid in failed {
+                self.failed_at.insert(udid.clone(), Instant::now());
+            }
+        }
+        result.map(|_| ())
+    }
+
+    /// Returns the UDIDs where something failed.
+    async fn run_refresh(
+        &mut self,
+        devices: &[Device],
+        filter: RefreshFilter,
+    ) -> Result<Vec<String>> {
+        let progress = self.progress();
+        let session = self.ensure_session().await?;
+        let results = install::refresh(session, devices, filter, progress).await?;
+        let mut failed = Vec::new();
+        for r in &results {
+            match &r.result {
+                Ok(o) => {
+                    let mut msg = format!("Re-signed {} on {}.", r.app.name, r.app.device_name);
+                    if let Some(exp) = o.expires_at {
+                        let local: chrono::DateTime<chrono::Local> = exp.into();
+                        msg.push_str(&format!(" Good until {}.", local.format("%a %b %e %H:%M")));
+                    }
+                    self.out.send(Event::Log(msg));
+                }
+                Err(e) => {
+                    failed.push(r.app.udid.clone());
+                    self.out.send(Event::Error(format!(
+                        "Re-signing {} failed: {e:#}",
+                        r.app.name
+                    )));
+                }
+            }
+        }
+        if !failed.is_empty() {
+            // A failure may be an expired session; sign in fresh next time
+            self.session = None;
+        }
+        self.send_apps();
+        Ok(failed)
     }
 
     async fn handle(&mut self, cmd: Cmd) -> Result<()> {
         match cmd {
-            Cmd::Login {
-                apple_id,
-                password,
-                save_password,
-            } => {
+            Cmd::Login { apple_id, password } => {
                 self.session = None;
-                self.login(apple_id, password, save_password).await?;
+                self.login(apple_id, password).await?;
+            }
+            Cmd::SignOut => {
+                if let Some(apple_id) = &self.config.apple_id {
+                    credentials::delete_password(apple_id)?;
+                }
+                self.session = None;
+                self.out.send(Event::SignedOut);
+                self.send_config();
+            }
+            Cmd::DeviceConnected(device) => {
+                self.out
+                    .send(Event::Log(format!("{} connected", device.name)));
+                self.discover().await;
+                self.auto_refresh(vec![*device]).await?;
+            }
+            Cmd::PeriodicCheck => {
+                let devices = device::discover(&self.paths, &DiscoverOptions::default()).await?;
+                self.out.send(Event::Devices(devices.clone()));
+                self.auto_refresh(devices).await?;
+            }
+            Cmd::SetAppAutoRefresh { key, enabled } => {
+                registry::set_auto_refresh(&self.paths, &key, enabled)?;
+                self.send_apps();
             }
             Cmd::Discover => self.discover().await,
             Cmd::SetupWifi { udid } => {
@@ -375,34 +577,24 @@ impl Worker {
             Cmd::Refresh { force } => {
                 let devices = device::discover(&self.paths, &DiscoverOptions::default()).await?;
                 self.out.send(Event::Devices(devices.clone()));
-                let progress = self.progress();
-                let session = self.ensure_session().await?;
-                let results = install::refresh(
-                    session,
-                    &devices,
-                    chrono::Duration::days(2),
-                    force,
-                    progress,
-                )
-                .await?;
-                if results.is_empty() {
+                let filter = if force {
+                    RefreshFilter::All
+                } else {
+                    RefreshFilter::ExpiringWithin(chrono::Duration::days(
+                        self.config.refresh_policy().days_left,
+                    ))
+                };
+                let apple_id = self.config.apple_id.clone();
+                if install::pending_refreshes(&self.paths, apple_id.as_deref(), &devices, filter)?
+                    .is_empty()
+                {
                     self.out.send(Event::Log(
-                        "Nothing to refresh (apps not due, or their devices aren't reachable)."
+                        "Nothing to re-sign (apps not due, or their devices aren't reachable)."
                             .into(),
                     ));
+                    return Ok(());
                 }
-                for r in results {
-                    match r.result {
-                        Ok(_) => self
-                            .out
-                            .send(Event::Log(format!("Refreshed {}", r.app.name))),
-                        Err(e) => self.out.send(Event::Error(format!(
-                            "Refreshing {} failed: {e:#}",
-                            r.app.name
-                        ))),
-                    }
-                }
-                self.send_apps();
+                self.run_refresh(&devices, filter).await?;
             }
             Cmd::ForgetApp(key) => {
                 registry::remove(&self.paths, &key)?;
@@ -412,6 +604,12 @@ impl Worker {
                 // A different anisette server needs a fresh login
                 if config.anisette_server != self.config.anisette_server {
                     self.session = None;
+                }
+                if self.config.stay_signed_in
+                    && !config.stay_signed_in
+                    && let Some(apple_id) = &config.apple_id
+                {
+                    credentials::delete_password(apple_id)?;
                 }
                 self.config = config;
                 self.config.save(&self.paths)?;

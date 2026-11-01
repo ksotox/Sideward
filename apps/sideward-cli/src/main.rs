@@ -1,10 +1,11 @@
 mod prompt;
 
 use std::{
+    collections::HashMap,
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -15,9 +16,10 @@ use sideward_core::{
     account::{self, LoginRequest},
     anisette, credentials,
     device::{self, DiscoverOptions, TransportFilter},
-    install::{self, InstallRequest, Progress, ProgressFn},
+    install::{self, InstallRequest, Progress, ProgressFn, RefreshFilter},
     ipa::{self, AppOptions},
-    registry, wifi,
+    registry::{self, RefreshPolicy},
+    watch, wifi,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -82,7 +84,8 @@ enum Command {
     },
     /// Show what's inside an IPA (no login needed)
     Inspect { ipa: PathBuf },
-    /// Log in and remember the Apple ID (and optionally the password)
+    /// Sign in. You stay signed in (password in the OS keychain) until the password
+    /// changes, Apple asks you to sign in again, or you run `logout`
     Login {
         #[command(flatten)]
         account: AccountArgs,
@@ -105,16 +108,23 @@ enum Command {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Keep running and refresh apps automatically (over Wi-Fi or USB)
+    /// Keep running and re-sign apps automatically: as soon as a device connects over USB or
+    /// shows up on Wi-Fi, plus a periodic check for devices that stay connected
     Daemon {
-        /// Hours between checks
-        #[arg(long, default_value_t = 6)]
+        /// Hours between periodic checks
+        #[arg(long, default_value_t = 1)]
         interval_hours: u64,
+        /// Override the AutoRefresh "days left" setting for this run
+        #[arg(long)]
+        days_left: Option<i64>,
         #[command(flatten)]
-        refresh: RefreshArgs,
+        transport: TransportArgs,
         #[command(flatten)]
         account: AccountArgs,
     },
+    /// AutoRefresh settings: re-sign apps automatically when their device connects
+    #[command(subcommand)]
+    AutoRefresh(AutoRefreshCommand),
     /// Development certificates on your account
     #[command(subcommand)]
     Certs(CertsCommand),
@@ -152,9 +162,33 @@ enum WifiCommand {
 #[derive(Subcommand)]
 enum AppsCommand {
     List,
+    /// Turn AutoRefresh on or off for one app (by bundle id or name)
+    AutoRefresh {
+        app: String,
+        #[arg(
+            action = clap::ArgAction::Set,
+            value_parser = clap::builder::BoolishValueParser::new(),
+            value_name = "on|off"
+        )]
+        enabled: bool,
+    },
     /// Stop refreshing an app (by bundle id or name) and delete its saved copy
     Forget {
         app: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutoRefreshCommand {
+    /// Show the current settings
+    Status,
+    /// Re-sign apps when their device connects (used by `daemon` and the desktop app)
+    On,
+    Off,
+    /// Re-sign once an app has fewer than this many days left (1-7; 7 = every time it
+    /// connects, at most every 12 hours)
+    Days {
+        days: i64,
     },
 }
 
@@ -317,9 +351,9 @@ struct AccountArgs {
     /// Anisette server for this login
     #[arg(long)]
     anisette: Option<String>,
-    /// Save the password in the system keychain
+    /// Don't keep the password in the system keychain after signing in
     #[arg(long)]
-    save_password: bool,
+    no_save_password: bool,
     /// When the certificate limit is hit, revoke the oldest one without asking
     #[arg(long)]
     auto_revoke: bool,
@@ -498,9 +532,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Daemon {
             interval_hours,
-            refresh,
+            days_left,
+            transport,
             account,
-        } => cmd_daemon(&mut ctx, interval_hours, &refresh, &account).await,
+        } => cmd_daemon(&mut ctx, interval_hours, days_left, &transport, &account).await,
+        Command::AutoRefresh(cmd) => cmd_auto_refresh(&mut ctx, cmd),
         Command::Certs(cmd) => match cmd {
             CertsCommand::List { account } => {
                 let mut session = login(&mut ctx, &account, true).await?;
@@ -573,32 +609,55 @@ async fn login(ctx: &mut Ctx, args: &AccountArgs, interactive: bool) -> Result<S
         None if interactive => prompt::ask("Apple ID: ").await?,
         None => bail!("No Apple ID; pass --apple-id"),
     };
+    let remember = ctx.config.stay_signed_in && !args.no_save_password;
+    let prompter: Arc<CliPrompter> = Arc::new(CliPrompter { interactive });
+    let request = |password: String| LoginRequest {
+        apple_id: apple_id.clone(),
+        password,
+        anisette_server: args.anisette.clone(),
+    };
+
     let saved = credentials::get_password(&apple_id)?;
-    let password = match saved.clone() {
+    let from_keychain = saved.is_some();
+    let password = match saved {
         Some(p) => p,
         None if interactive => prompt::read_password(&format!("Password for {apple_id}: ")).await?,
         None => bail!(
-            "No saved password for {apple_id}; run `sideward login --save-password` or set SIDEWARD_PASSWORD"
+            "Not signed in as {apple_id}; run `sideward login` once (or set SIDEWARD_PASSWORD)"
         ),
     };
-    let prompter = Arc::new(CliPrompter { interactive });
-    let session = account::login(
+    let result = account::login_and_remember(
         &ctx.paths,
         &mut ctx.config,
-        LoginRequest {
-            apple_id: apple_id.clone(),
-            password: password.clone(),
-            anisette_server: args.anisette.clone(),
-        },
-        prompter,
+        request(password),
+        from_keychain,
+        remember,
+        prompter.clone(),
     )
-    .await?;
-    session.set_auto_revoke(args.auto_revoke);
-    if args.save_password && saved.as_deref() != Some(password.as_str()) {
-        match credentials::save_password(&apple_id, &password) {
-            Ok(()) => println!("Saved the password to the system keychain."),
-            Err(e) => eprintln!("Couldn't save the password: {e:#}"),
+    .await;
+    let session = match result {
+        Ok(s) => s,
+        // The saved password stopped working (changed on Apple's side): ask once more
+        Err(e) if interactive && e.is::<account::SavedPasswordRejected>() => {
+            eprintln!("{e}");
+            let password = prompt::read_password(&format!("Password for {apple_id}: ")).await?;
+            account::login_and_remember(
+                &ctx.paths,
+                &mut ctx.config,
+                request(password),
+                false,
+                remember,
+                prompter,
+            )
+            .await?
         }
+        Err(e) => return Err(e),
+    };
+    session.set_auto_revoke(args.auto_revoke);
+    if remember && !from_keychain {
+        println!(
+            "You'll stay signed in until your password changes or Apple asks again. `sideward logout` signs out."
+        );
     }
     Ok(session)
 }
@@ -739,7 +798,10 @@ fn cmd_apps(ctx: &Ctx, cmd: AppsCommand) -> Result<()> {
                 return Ok(());
             }
             let now = chrono::Utc::now();
-            println!("{:<22} {:<38} {:<18} EXPIRES", "APP", "BUNDLE ID", "DEVICE");
+            println!(
+                "{:<22} {:<38} {:<18} {:<12} AUTO",
+                "APP", "BUNDLE ID", "DEVICE", "EXPIRES"
+            );
             for a in apps {
                 let expiry = match a.expires_at {
                     Some(e) if e <= now => "expired".to_string(),
@@ -750,13 +812,25 @@ fn cmd_apps(ctx: &Ctx, cmd: AppsCommand) -> Result<()> {
                     None => "unknown".into(),
                 };
                 println!(
-                    "{:<22} {:<38} {:<18} {}",
+                    "{:<22} {:<38} {:<18} {:<12} {}",
                     truncate(&a.name, 22),
                     truncate(&a.bundle_id, 38),
                     truncate(&a.device_name, 18),
-                    expiry
+                    expiry,
+                    if a.auto_refresh { "on" } else { "off" }
                 );
             }
+            Ok(())
+        }
+        AppsCommand::AutoRefresh { app, enabled } => {
+            let n = registry::set_auto_refresh(&ctx.paths, &app, enabled)?;
+            if n == 0 {
+                bail!("No remembered app matches \"{app}\"; see `sideward apps list`");
+            }
+            println!(
+                "AutoRefresh {} for {n} app(s)",
+                if enabled { "on" } else { "off" }
+            );
             Ok(())
         }
         AppsCommand::Forget { app } => {
@@ -769,15 +843,22 @@ fn cmd_apps(ctx: &Ctx, cmd: AppsCommand) -> Result<()> {
 
 async fn run_refresh(ctx: &Ctx, session: &mut Session, args: &RefreshArgs) -> Result<usize> {
     let devices = discover(ctx, &args.transport).await?;
+    let filter = if args.all {
+        RefreshFilter::All
+    } else {
+        RefreshFilter::ExpiringWithin(chrono::Duration::days(args.days))
+    };
+    refresh_on(session, &devices, filter).await
+}
+
+/// Refresh and print the results; returns how many failed.
+async fn refresh_on(
+    session: &mut Session,
+    devices: &[device::Device],
+    filter: RefreshFilter,
+) -> Result<usize> {
     let progress = ProgressUi::new();
-    let results = install::refresh(
-        session,
-        &devices,
-        chrono::Duration::days(args.days),
-        args.all,
-        progress.callback(),
-    )
-    .await;
+    let results = install::refresh(session, devices, filter, progress.callback()).await;
     progress.finish();
     let results = results?;
     if results.is_empty() {
@@ -802,44 +883,126 @@ async fn run_refresh(ctx: &Ctx, session: &mut Session, args: &RefreshArgs) -> Re
     Ok(failures)
 }
 
+/// Log in again after this long; Apple's developer session tokens expire.
+const SESSION_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+/// After a failed automatic refresh, leave that device alone for this long.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
 async fn cmd_daemon(
     ctx: &mut Ctx,
     interval_hours: u64,
-    refresh: &RefreshArgs,
+    days_left: Option<i64>,
+    transport: &TransportArgs,
     account: &AccountArgs,
 ) -> Result<()> {
     // First login is interactive so 2FA can be answered; later ones must be silent
     let mut session = Some(login(ctx, account, true).await?);
-    println!("Refreshing apps every {interval_hours}h. Press Ctrl+C to stop.");
+    let policy = RefreshPolicy::new(days_left.unwrap_or(ctx.config.refresh_days_left));
+    let filter = RefreshFilter::Auto(policy);
+    let (tx, mut connected) = tokio::sync::mpsc::unbounded_channel();
+    if ctx.config.auto_refresh_on_connect {
+        watch::spawn(ctx.paths.clone(), Duration::from_secs(5 * 60), tx);
+        println!(
+            "Watching for devices. Apps with AutoRefresh on are re-signed when fewer than {} day(s) are left.",
+            policy.days_left
+        );
+    } else {
+        println!(
+            "AutoRefresh on connect is off (`sideward auto-refresh on`); checking every {interval_hours}h only."
+        );
+    }
+    println!("Press Ctrl+C to stop.");
+
+    let mut failed_at: HashMap<String, Instant> = HashMap::new();
+    let mut periodic = tokio::time::interval(Duration::from_secs(interval_hours.max(1) * 3600));
     loop {
-        let current = match session.as_mut() {
-            Some(s) => s,
-            None => match login(ctx, account, false).await {
-                Ok(s) => session.insert(s),
+        let devices = tokio::select! {
+            Some(device) = connected.recv() => vec![device],
+            _ = periodic.tick() => match discover(ctx, transport).await {
+                Ok(d) => d,
                 Err(e) => {
-                    eprintln!("Login failed, will retry next round: {e:#}");
-                    tokio::time::sleep(Duration::from_secs(interval_hours.max(1) * 3600)).await;
+                    eprintln!("Couldn't list devices: {e:#}");
                     continue;
                 }
             },
+            _ = tokio::signal::ctrl_c() => {
+                println!("Stopping.");
+                return Ok(());
+            }
         };
-        match run_refresh(ctx, current, refresh).await {
-            // A failure may be an expired session; log in fresh next round
-            Ok(failures) if failures > 0 => session = None,
-            Ok(_) => {}
+        let devices: Vec<_> = devices
+            .into_iter()
+            .filter(|d| {
+                failed_at
+                    .get(&d.udid)
+                    .is_none_or(|t| t.elapsed() > FAILURE_BACKOFF)
+            })
+            .collect();
+        let apple_id = session
+            .as_ref()
+            .map(|s| s.apple_id.clone())
+            .or(ctx.config.apple_id.clone());
+        let pending =
+            install::pending_refreshes(&ctx.paths, apple_id.as_deref(), &devices, filter)?;
+        if pending.is_empty() {
+            continue;
+        }
+        if session.as_ref().is_none_or(|s| s.age() > SESSION_MAX_AGE) {
+            session = match login(ctx, account, false).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Sign-in failed, will retry later: {e:#}");
+                    None
+                }
+            };
+        }
+        let Some(current) = session.as_mut() else {
+            continue;
+        };
+        match refresh_on(current, &devices, filter).await {
+            Ok(0) => {}
+            Ok(_) => {
+                for d in &devices {
+                    failed_at.insert(d.udid.clone(), Instant::now());
+                }
+                // A failure may be an expired session; sign in fresh next time
+                session = None;
+            }
             Err(e) => {
                 eprintln!("Refresh failed: {e:#}");
                 session = None;
             }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval_hours.max(1) * 3600)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                println!("Stopping.");
-                return Ok(());
+    }
+}
+
+fn cmd_auto_refresh(ctx: &mut Ctx, cmd: AutoRefreshCommand) -> Result<()> {
+    match cmd {
+        AutoRefreshCommand::Status => {}
+        AutoRefreshCommand::On => ctx.config.auto_refresh_on_connect = true,
+        AutoRefreshCommand::Off => ctx.config.auto_refresh_on_connect = false,
+        AutoRefreshCommand::Days { days } => {
+            if !(1..=7).contains(&days) {
+                bail!("Pick between 1 and 7 days");
             }
+            ctx.config.refresh_days_left = days;
         }
     }
+    ctx.config.save(&ctx.paths)?;
+    println!(
+        "AutoRefresh on connect: {}",
+        if ctx.config.auto_refresh_on_connect {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    match ctx.config.refresh_days_left {
+        7 => println!("Re-sign: every time a device connects (at most every 12 hours per app)"),
+        d => println!("Re-sign: when an app has fewer than {d} day(s) left"),
+    }
+    println!("Runs while `sideward daemon` or the desktop app is open.");
+    Ok(())
 }
 
 fn cmd_anisette(ctx: &mut Ctx, cmd: AnisetteCommand) -> Result<()> {
@@ -932,5 +1095,15 @@ impl ProgressUi {
         if let Some(pb) = self.bar.lock().unwrap_or_else(|e| e.into_inner()).take() {
             pb.finish_and_clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        super::Cli::command().debug_assert();
     }
 }

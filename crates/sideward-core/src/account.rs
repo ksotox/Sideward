@@ -68,6 +68,84 @@ pub struct Session {
     pub(crate) register_extensions: Arc<AtomicBool>,
     /// Read by the max-certs callback on every signing run.
     pub(crate) auto_revoke: Arc<AtomicBool>,
+    created: std::time::Instant,
+}
+
+/// Apple rejected the password saved in the keychain, so it was forgotten. The user has to
+/// sign in again (usually because they changed their Apple ID password).
+#[derive(Debug)]
+pub struct SavedPasswordRejected {
+    pub apple_id: String,
+}
+
+impl std::fmt::Display for SavedPasswordRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Apple rejected the saved password for {} (was it changed?). Sign in again.",
+            self.apple_id
+        )
+    }
+}
+
+impl std::error::Error for SavedPasswordRejected {}
+
+/// Apple's "incorrect Apple ID or password" error.
+pub fn is_wrong_password(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("-22406")
+}
+
+/// Log in and, with `remember`, keep the password in the OS keychain so the user stays signed
+/// in. When the password came from the keychain and Apple rejects it, it is deleted and
+/// [`SavedPasswordRejected`] is returned.
+pub async fn login_and_remember(
+    paths: &Paths,
+    config: &mut Config,
+    request: LoginRequest,
+    from_keychain: bool,
+    remember: bool,
+    prompter: Arc<dyn Prompter>,
+) -> Result<Session> {
+    let apple_id = request.apple_id.trim().to_lowercase();
+    let password = request.password.clone();
+    match login(paths, config, request, prompter).await {
+        Ok(session) => {
+            if remember
+                && !from_keychain
+                && let Err(e) = crate::credentials::save_password(&apple_id, &password)
+            {
+                warn!("Couldn't save the password to the keychain: {e:#}");
+            }
+            Ok(session)
+        }
+        Err(e) if from_keychain && is_wrong_password(&e) => {
+            let _ = crate::credentials::delete_password(&apple_id);
+            Err(anyhow::Error::new(SavedPasswordRejected { apple_id }))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Log in with the remembered Apple ID and its saved password, if there are both.
+pub async fn login_saved(
+    paths: &Paths,
+    config: &mut Config,
+    prompter: Arc<dyn Prompter>,
+) -> Result<Option<Session>> {
+    let Some(apple_id) = config.apple_id.clone() else {
+        return Ok(None);
+    };
+    let Some(password) = crate::credentials::get_password(&apple_id)? else {
+        return Ok(None);
+    };
+    let request = LoginRequest {
+        apple_id,
+        password,
+        anisette_server: None,
+    };
+    login_and_remember(paths, config, request, true, true, prompter)
+        .await
+        .map(Some)
 }
 
 fn to_report(e: anyhow::Error) -> rootcause::Report {
@@ -187,6 +265,7 @@ pub async fn login(
         paths: paths.clone(),
         register_extensions,
         auto_revoke,
+        created: std::time::Instant::now(),
     })
 }
 
@@ -278,6 +357,12 @@ async fn choose_team(
 }
 
 impl Session {
+    /// How long ago this session logged in. Apple's developer session tokens don't last
+    /// forever, so long-running callers log in again after a while.
+    pub fn age(&self) -> std::time::Duration {
+        self.created.elapsed()
+    }
+
     pub fn dev_session(&mut self) -> &mut DeveloperSession {
         self.sideloader.get_dev_session()
     }

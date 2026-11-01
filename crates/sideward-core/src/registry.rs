@@ -31,6 +31,32 @@ pub struct InstalledApp {
     pub options: AppOptions,
     pub installed_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Re-sign automatically when the device connects (Sideloadly's "AutoRefresh").
+    #[serde(default = "default_true")]
+    pub auto_refresh: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Never re-sign the same app more often than this, so a device that keeps reconnecting (or
+/// stays on Wi-Fi) doesn't trigger a re-sign on every scan.
+pub const REFRESH_COOLDOWN_HOURS: i64 = 12;
+
+/// When automatic refresh re-signs an app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshPolicy {
+    /// Re-sign once fewer than this many days are left (1-7).
+    pub days_left: i64,
+}
+
+impl RefreshPolicy {
+    pub fn new(days_left: i64) -> Self {
+        Self {
+            days_left: days_left.clamp(1, 7),
+        }
+    }
 }
 
 impl InstalledApp {
@@ -46,6 +72,38 @@ impl InstalledApp {
             None => self.installed_at + Duration::days(6) <= now,
         }
     }
+
+    /// Whether automatic refresh (on connect, or the periodic check) should re-sign this app.
+    pub fn wants_auto_refresh(&self, policy: &RefreshPolicy, now: DateTime<Utc>) -> bool {
+        if !self.auto_refresh {
+            return false;
+        }
+        // An expired app is always worth re-signing; otherwise respect the cooldown
+        let expired = self.expires_at.is_some_and(|e| e <= now);
+        if !expired && self.installed_at + Duration::hours(REFRESH_COOLDOWN_HOURS) > now {
+            return false;
+        }
+        self.is_due(Duration::days(policy.days_left), now)
+    }
+}
+
+/// Turn automatic refresh on or off for apps matching `query` (key, bundle id, or name).
+pub fn set_auto_refresh(paths: &Paths, query: &str, enabled: bool) -> Result<usize> {
+    let mut map: BTreeMap<String, InstalledApp> = read_json(&paths.registry_file())?;
+    let mut changed = 0;
+    for app in map.values_mut() {
+        if app.key() == query || app.bundle_id == query || app.name.eq_ignore_ascii_case(query) {
+            app.auto_refresh = enabled;
+            changed += 1;
+        }
+    }
+    write_json(&paths.registry_file(), &map)?;
+    Ok(changed)
+}
+
+pub fn get(paths: &Paths, key: &str) -> Result<Option<InstalledApp>> {
+    let map: BTreeMap<String, InstalledApp> = read_json(&paths.registry_file())?;
+    Ok(map.get(key).cloned())
 }
 
 pub fn list(paths: &Paths) -> Result<Vec<InstalledApp>> {
@@ -168,6 +226,7 @@ mod tests {
             options: AppOptions::default(),
             installed_at: now - Duration::days(installed_days_ago),
             expires_at: expires_in_days.map(|d| now + Duration::days(d)),
+            auto_refresh: true,
         }
     }
 
@@ -178,6 +237,38 @@ mod tests {
         assert!(!app(Some(5), 2).is_due(Duration::days(2), now));
         assert!(app(None, 7).is_due(Duration::days(2), now));
         assert!(!app(None, 1).is_due(Duration::days(2), now));
+    }
+
+    #[test]
+    fn auto_refresh_policy() {
+        let now = Utc::now();
+        let three_days = RefreshPolicy::new(3);
+        let every_connect = RefreshPolicy::new(7);
+        // 6 days left: not due under "3 days left", due under "every connect"
+        let fresh = app(Some(6), 1);
+        assert!(!fresh.wants_auto_refresh(&three_days, now));
+        assert!(fresh.wants_auto_refresh(&every_connect, now));
+        // Signed an hour ago: cooldown applies even under "every connect"
+        let mut just_signed = app(Some(7), 0);
+        just_signed.installed_at = now - Duration::hours(1);
+        assert!(!just_signed.wants_auto_refresh(&every_connect, now));
+        // Expired apps skip the cooldown
+        let mut expired = app(Some(-1), 0);
+        expired.installed_at = now - Duration::hours(1);
+        assert!(expired.wants_auto_refresh(&three_days, now));
+        // Turned off per app
+        let mut off = app(Some(1), 6);
+        off.auto_refresh = false;
+        assert!(!off.wants_auto_refresh(&three_days, now));
+        assert_eq!(RefreshPolicy::new(30).days_left, 7);
+    }
+
+    #[test]
+    fn old_records_default_to_auto_refresh() {
+        let mut json = serde_json::to_value(app(Some(3), 4)).unwrap();
+        json.as_object_mut().unwrap().remove("auto_refresh");
+        let parsed: InstalledApp = serde_json::from_value(json).unwrap();
+        assert!(parsed.auto_refresh);
     }
 
     #[test]
@@ -206,6 +297,8 @@ mod tests {
         a.source = source.clone();
         upsert(&paths, a.clone()).unwrap();
         assert_eq!(list(&paths).unwrap().len(), 1);
+        assert_eq!(set_auto_refresh(&paths, "X", false).unwrap(), 1);
+        assert!(!get(&paths, &a.key()).unwrap().unwrap().auto_refresh);
         assert_eq!(remove(&paths, "com.x.T").unwrap(), 1);
         assert!(list(&paths).unwrap().is_empty());
         assert!(!source.exists());

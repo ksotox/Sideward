@@ -206,6 +206,8 @@ impl Session {
         outcome: &InstallOutcome,
     ) -> Result<()> {
         let key = format!("{}@{}", outcome.installed_bundle_id, device.udid);
+        // Re-signing keeps the user's AutoRefresh choice; new installs start with it on
+        let auto_refresh = registry::get(&self.paths, &key)?.is_none_or(|a| a.auto_refresh);
         let (source, options) =
             registry::store_sources(&self.paths, &key, &request.source, &request.options)?;
         registry::upsert(
@@ -222,6 +224,7 @@ impl Session {
                 options,
                 installed_at: Utc::now(),
                 expires_at: outcome.expires_at,
+                auto_refresh,
             },
         )
     }
@@ -268,20 +271,57 @@ pub struct RefreshResult {
     pub result: Result<InstallOutcome>,
 }
 
-/// Re-sign and reinstall remembered apps that expire within `margin` (or all of them with
-/// `force`), on whichever of `devices` they were installed to. Apps from other Apple IDs, and
-/// apps whose device isn't reachable, are skipped.
+/// Which remembered apps a refresh should re-sign.
+#[derive(Debug, Clone, Copy)]
+pub enum RefreshFilter {
+    /// Every app, whatever its expiry or AutoRefresh setting.
+    All,
+    /// Apps expiring within this margin (manual `refresh`).
+    ExpiringWithin(chrono::Duration),
+    /// Apps with AutoRefresh on that the policy says are due (on connect, periodic check).
+    Auto(registry::RefreshPolicy),
+}
+
+impl RefreshFilter {
+    pub fn matches(&self, app: &InstalledApp, now: DateTime<Utc>) -> bool {
+        match self {
+            RefreshFilter::All => true,
+            RefreshFilter::ExpiringWithin(margin) => app.is_due(*margin, now),
+            RefreshFilter::Auto(policy) => app.wants_auto_refresh(policy, now),
+        }
+    }
+}
+
+/// Apps signed with this session's Apple ID that `filter` selects, installed on one of
+/// `devices`. Cheap (no network), so callers can check before logging in.
+pub fn pending_refreshes(
+    paths: &crate::paths::Paths,
+    apple_id: Option<&str>,
+    devices: &[Device],
+    filter: RefreshFilter,
+) -> Result<Vec<InstalledApp>> {
+    let now = Utc::now();
+    Ok(registry::list(paths)?
+        .into_iter()
+        .filter(|a| apple_id.is_none_or(|id| a.apple_id.eq_ignore_ascii_case(id)))
+        .filter(|a| devices.iter().any(|d| d.udid == a.udid))
+        .filter(|a| filter.matches(a, now))
+        .collect())
+}
+
+/// Re-sign and reinstall the remembered apps `filter` selects, on whichever of `devices`
+/// they were installed to. Apps from other Apple IDs, and apps whose device isn't reachable,
+/// are skipped.
 pub async fn refresh(
     session: &mut Session,
     devices: &[Device],
-    margin: chrono::Duration,
-    force: bool,
+    filter: RefreshFilter,
     progress: ProgressFn,
 ) -> Result<Vec<RefreshResult>> {
     let now = Utc::now();
     let mut results = Vec::new();
     for app in registry::list(&session.paths)? {
-        if app.apple_id != session.apple_id || !(force || app.is_due(margin, now)) {
+        if !app.apple_id.eq_ignore_ascii_case(&session.apple_id) || !filter.matches(&app, now) {
             continue;
         }
         let Some(device) = devices

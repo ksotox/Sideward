@@ -1,4 +1,12 @@
-use std::{net::IpAddr, path::PathBuf, sync::mpsc::Receiver};
+use std::{
+    net::IpAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
+};
 
 use eframe::egui::{self, Color32, RichText};
 use isideload::auth::apple_account::{TwoFactorCallbackParams, TwoFactorCallbackResponse};
@@ -102,6 +110,22 @@ impl OptionsForm {
     }
 }
 
+/// Bring the window back from the tray, the taskbar, or behind other windows.
+pub fn show_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
+}
+
+/// How the app was started.
+pub struct Launch {
+    /// Started by the login item: stay out of the way.
+    pub background: bool,
+    /// Lets later launches (e.g. double-clicking the exe) bring this window up.
+    pub instance_listener: Option<std::net::TcpListener>,
+}
+
 pub struct SidewardApp {
     cmd: UnboundedSender<Cmd>,
     events: Receiver<Event>,
@@ -110,7 +134,6 @@ pub struct SidewardApp {
     config: Config,
     apple_id: String,
     password: String,
-    save_password: bool,
     has_saved_password: bool,
     logged_in: Option<(String, String, String)>,
 
@@ -130,11 +153,34 @@ pub struct SidewardApp {
     fraction: f32,
     log: Vec<LogLine>,
     prompt: Option<ActivePrompt>,
+
+    /// Actual OS login-item state (the config value is only what the user last chose).
+    launch_at_login: bool,
+    /// Set by the tray's Quit so closing really quits.
+    quitting: Arc<AtomicBool>,
+    #[cfg(any(windows, target_os = "macos"))]
+    tray: Option<tray_icon::TrayIcon>,
+    minimize_on_first_frame: bool,
+    told_about_background: bool,
 }
 
 impl SidewardApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
-        let (cmd, events) = worker::spawn(cc.egui_ctx.clone())?;
+    pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> anyhow::Result<Self> {
+        let ctx = cc.egui_ctx.clone();
+        let (cmd, events) = worker::spawn(ctx.clone())?;
+        if let Some(listener) = launch.instance_listener {
+            let show_ctx = ctx.clone();
+            crate::system::listen_for_launches(listener, move || show_window(&show_ctx));
+        }
+        let quitting = Arc::new(AtomicBool::new(false));
+        #[cfg(any(windows, target_os = "macos"))]
+        let tray = match crate::tray::create(&ctx, cmd.clone(), quitting.clone()) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("No tray icon: {e:#}");
+                None
+            }
+        };
         let mut app = Self {
             cmd,
             events,
@@ -142,7 +188,6 @@ impl SidewardApp {
             config: Config::default(),
             apple_id: String::new(),
             password: String::new(),
-            save_password: true,
             has_saved_password: false,
             logged_in: None,
             devices: Vec::new(),
@@ -158,12 +203,59 @@ impl SidewardApp {
             fraction: 0.0,
             log: Vec::new(),
             prompt: None,
+            launch_at_login: crate::system::launch_at_login_enabled(),
+            quitting,
+            #[cfg(any(windows, target_os = "macos"))]
+            tray,
+            minimize_on_first_frame: false,
+            told_about_background: false,
         };
+        // Started at login: hidden in the tray, or minimized where there's no tray
+        if launch.background {
+            if app.has_tray() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                app.minimize_on_first_frame = true;
+            }
+        }
         // `sideward-gui App.ipa` (or opening an .ipa with it) preselects the app
-        if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
+        if let Some(path) = std::env::args_os()
+            .skip(1)
+            .find(|a| a != crate::system::BACKGROUND_ARG)
+            .map(PathBuf::from)
+        {
             app.set_app(path);
         }
         Ok(app)
+    }
+
+    fn has_tray(&self) -> bool {
+        #[cfg(any(windows, target_os = "macos"))]
+        return self.tray.is_some();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        false
+    }
+
+    /// Closing the window keeps Sideward running (to re-sign apps when devices connect)
+    /// unless that's turned off or the user chose Quit from the tray.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        // Without a tray (Linux) there'd be no way back, so closing quits there
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if !close_requested
+            || !self.has_tray()
+            || !self.config.run_in_background
+            || self.quitting.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if !self.told_about_background {
+            self.told_about_background = true;
+            self.log.push(LogLine::Info(
+                "Sideward keeps running in the tray so it can re-sign apps when devices connect. Quit from the tray icon, or turn this off in Settings.".into(),
+            ));
+        }
     }
 
     fn send(&self, cmd: Cmd) {
@@ -185,9 +277,14 @@ impl SidewardApp {
         self.app_path = Some(path);
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events.try_recv() {
             match event {
+                Event::Attention => show_window(ctx),
+                Event::SignedOut => {
+                    self.logged_in = None;
+                    self.has_saved_password = false;
+                }
                 Event::Log(m) => self.log.push(LogLine::Info(m)),
                 Event::Error(m) => self.log.push(LogLine::Error(m)),
                 Event::Config {
@@ -242,6 +339,8 @@ impl SidewardApp {
                 }
                 Event::Apps(apps) => self.apps = apps,
                 Event::Prompt(p) => {
+                    // 2FA etc. may arrive while Sideward is in the tray
+                    show_window(ctx);
                     self.prompt = Some(match p {
                         Prompt::TwoFactor { params, reply } => ActivePrompt::TwoFactor {
                             params,
@@ -297,9 +396,17 @@ impl SidewardApp {
                 );
                 ui.weak(format!("{team} · anisette: {server}"));
             });
-            if ui.small_button("Switch account").clicked() {
-                self.logged_in = None;
-            }
+            let note = if self.config.stay_signed_in {
+                "You stay signed in until your password changes or Apple asks again."
+            } else {
+                "Your password isn't saved; you'll sign in again next time."
+            };
+            ui.horizontal(|ui| {
+                ui.weak(note);
+                if ui.small_button("Sign out").clicked() {
+                    self.send(Cmd::SignOut);
+                }
+            });
             return;
         }
         let busy = self.busy.is_some();
@@ -329,21 +436,19 @@ impl SidewardApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut self.save_password,
-                "Remember password (needed for auto-refresh)",
-            );
+            ui.checkbox(&mut self.config.stay_signed_in, "Stay signed in")
+                .on_hover_text("Keeps your password in the system keychain until it changes or Apple asks you to sign in again. Needed for AutoRefresh.");
             let can_login = !busy
                 && !self.apple_id.trim().is_empty()
                 && (!self.password.is_empty() || self.has_saved_password);
             if ui
-                .add_enabled(can_login, egui::Button::new("Log in"))
+                .add_enabled(can_login, egui::Button::new("Sign in"))
                 .clicked()
             {
+                self.send(Cmd::SaveConfig(self.config.clone()));
                 self.send(Cmd::Login {
                     apple_id: self.apple_id.trim().to_string(),
                     password: self.password.clone(),
-                    save_password: self.save_password,
                 });
             }
         });
@@ -567,19 +672,25 @@ impl SidewardApp {
             ui.heading("Installed apps");
             let idle = self.busy.is_none();
             if ui
-                .add_enabled(idle, egui::Button::new("Refresh due apps"))
+                .add_enabled(idle, egui::Button::new("Re-sign due apps"))
                 .clicked()
             {
                 self.send(Cmd::Refresh { force: false });
             }
             if ui
-                .add_enabled(idle, egui::Button::new("Refresh all"))
+                .add_enabled(idle, egui::Button::new("Re-sign all"))
                 .clicked()
             {
                 self.send(Cmd::Refresh { force: true });
             }
         });
-        ui.weak("Free Apple IDs sign apps for 7 days. Refreshing re-signs them over USB or Wi-Fi without losing data.");
+        ui.weak("Free Apple IDs sign apps for 7 days. With AutoRefresh on, Sideward re-signs an app when its device connects over USB or Wi-Fi, keeping the app's data.");
+        if !self.config.auto_refresh_on_connect {
+            ui.colored_label(
+                Color32::from_rgb(230, 160, 40),
+                "AutoRefresh on connect is turned off in Settings.",
+            );
+        }
         ui.add_space(6.0);
         if self.apps.is_empty() {
             ui.label("Apps you install with “Remember for auto-refresh” show up here.");
@@ -587,21 +698,25 @@ impl SidewardApp {
         }
         let now = chrono::Utc::now();
         let mut forget = None;
+        let mut toggled = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("apps")
                 .striped(true)
-                .num_columns(4)
+                .min_col_width(60.0)
+                .num_columns(5)
                 .spacing([16.0, 6.0])
                 .show(ui, |ui| {
                     ui.strong("App");
                     ui.strong("Device");
                     ui.strong("Expires");
+                    ui.strong("AutoRefresh");
                     ui.label("");
                     ui.end_row();
                     for a in &self.apps {
                         ui.vertical(|ui| {
-                            ui.label(&a.name);
-                            ui.weak(&a.bundle_id);
+                            ui.set_min_width(220.0);
+                            ui.add(egui::Label::new(&a.name).extend());
+                            ui.add(egui::Label::new(RichText::new(&a.bundle_id).weak().small()).extend());
                         });
                         ui.label(&a.device_name);
                         match a.expires_at {
@@ -622,6 +737,14 @@ impl SidewardApp {
                                 ui.weak("unknown");
                             }
                         }
+                        let mut auto = a.auto_refresh;
+                        if ui
+                            .checkbox(&mut auto, "")
+                            .on_hover_text("Re-sign this app automatically before its 7 days pass, whenever its device connects")
+                            .changed()
+                        {
+                            toggled = Some((a.key(), auto));
+                        }
                         if ui.small_button("Forget").clicked() {
                             forget = Some(a.key());
                         }
@@ -629,15 +752,73 @@ impl SidewardApp {
                     }
                 });
         });
+        if let Some((key, enabled)) = toggled {
+            self.send(Cmd::SetAppAutoRefresh { key, enabled });
+        }
         if let Some(key) = forget {
             self.send(Cmd::ForgetApp(key));
         }
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        let mut config = self.config.clone();
+
+        ui.heading("AutoRefresh");
+        ui.checkbox(
+            &mut config.auto_refresh_on_connect,
+            "Re-sign apps automatically when a device connects (USB or Wi-Fi)",
+        );
+        ui.add_enabled_ui(config.auto_refresh_on_connect, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Re-sign when an app has fewer than");
+                ui.add(
+                    egui::Slider::new(&mut config.refresh_days_left, 1..=7).suffix(" days left"),
+                );
+            });
+            if config.refresh_days_left >= 7 {
+                ui.weak("That's every time the device connects (at most every 12 hours per app).");
+            }
+        });
+        ui.weak("Wi-Fi devices are checked every 5 minutes, and connected devices every hour.");
+
+        ui.add_space(12.0);
+        ui.heading("Account");
+        ui.checkbox(&mut config.stay_signed_in, "Stay signed in")
+            .on_hover_text("Turning this off forgets the saved password.");
+        ui.weak("The password stays in the system keychain until it changes, Apple asks you to sign in again, or you sign out.");
+
+        ui.add_space(12.0);
+        ui.heading("Startup");
+        let mut launch = self.launch_at_login;
+        if ui
+            .checkbox(
+                &mut launch,
+                "Start Sideward when I sign in to this computer",
+            )
+            .changed()
+        {
+            match crate::system::set_launch_at_login(launch) {
+                Ok(()) => {
+                    self.launch_at_login = launch;
+                    config.launch_at_login = launch;
+                }
+                Err(e) => self.log.push(LogLine::Error(format!(
+                    "Couldn't change the startup setting: {e:#}"
+                ))),
+            }
+        }
+        if self.has_tray() {
+            ui.checkbox(
+                &mut config.run_in_background,
+                "Keep running in the tray when the window is closed",
+            );
+        } else {
+            ui.weak("AutoRefresh runs while this window is open (minimized is fine).");
+        }
+
+        ui.add_space(12.0);
         ui.heading("Anisette server");
         ui.label("Apple's login needs device data from an anisette server. If Apple rejects one (errors like -80045 or -80046), Sideward can switch automatically.");
-        let mut config = self.config.clone();
         let current = anisette::normalize(&config.anisette_server);
         egui::ComboBox::from_id_salt("anisette")
             .width(360.0)
@@ -662,10 +843,7 @@ impl SidewardApp {
             ui.label("Machine name shown on Apple's side");
             ui.text_edit_singleline(&mut config.machine_name);
         });
-        if config.anisette_server != self.config.anisette_server
-            || config.anisette_auto_fallback != self.config.anisette_auto_fallback
-            || config.machine_name != self.config.machine_name
-        {
+        if config_changed(&config, &self.config) {
             if config.anisette_server != self.config.anisette_server {
                 self.logged_in = None;
             }
@@ -833,6 +1011,10 @@ impl SidewardApp {
     }
 }
 
+fn config_changed(a: &Config, b: &Config) -> bool {
+    serde_json::to_value(a).ok() != serde_json::to_value(b).ok()
+}
+
 fn device_label(d: &Device) -> String {
     let kind = match d.transport {
         TransportKind::Usb => "USB",
@@ -849,8 +1031,17 @@ fn device_label(d: &Device) -> String {
 }
 
 impl eframe::App for SidewardApp {
+    /// Runs even while the window is hidden in the tray, so prompts can bring it back.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.minimize_on_first_frame) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        self.handle_close(&ctx);
 
         let dropped: Option<PathBuf> = ui.input(|i| {
             i.raw
@@ -908,7 +1099,6 @@ impl eframe::App for SidewardApp {
             });
         });
 
-        let ctx = ui.ctx().clone();
         self.prompt_modal(&ctx);
     }
 }

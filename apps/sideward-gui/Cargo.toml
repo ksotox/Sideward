@@ -17,7 +17,13 @@ tokio.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
 tracing-subscriber.workspace = true
 chrono = "0.4"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+auto-launch = "0.6"
+
+# The tray needs GTK on Linux, so Linux minimizes to the taskbar instead
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
