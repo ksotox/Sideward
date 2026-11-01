@@ -4,7 +4,8 @@ use std::{fmt, future::Future, net::IpAddr, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use idevice::{
-    Idevice, IdeviceError, IdeviceService,
+    HeartbeatError, Idevice, IdeviceError, IdeviceService,
+    heartbeat::HeartbeatClient,
     lockdown::LockdownClient,
     pairing_file::PairingFile,
     provider::{IdeviceProvider, TcpProvider, UsbmuxdProvider},
@@ -362,6 +363,63 @@ impl Device {
     }
 }
 
+/// Keeps a Wi-Fi connection alive. iOS closes service connections over the network (the AFC
+/// upload, the installer) unless a heartbeat client keeps answering the device's "Marco" with
+/// "Polo"; without it, Wi-Fi installs die partway with "device socket io failed".
+/// Dropping the guard stops it.
+pub struct Heartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Heartbeat {
+    pub fn is_running(&self) -> bool {
+        !self.task.is_finished()
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Device {
+    /// Start a heartbeat for Wi-Fi transports; USB doesn't need one (returns `None`).
+    pub async fn start_heartbeat(&self, paths: &Paths) -> Result<Option<Heartbeat>> {
+        if !self.transport.is_wifi() {
+            return Ok(None);
+        }
+        let provider = self.connect(paths).await?;
+        let client = HeartbeatClient::connect(&provider)
+            .await
+            .context("Couldn't start the Wi-Fi heartbeat")?;
+        let task = tokio::spawn(keep_alive(client, self.name.clone()));
+        Ok(Some(Heartbeat { task }))
+    }
+}
+
+/// Answer every Marco with a Polo until the device goes to sleep or the connection closes.
+async fn keep_alive(mut client: HeartbeatClient, name: String) {
+    // The device announces its own interval in each Marco; allow some slack on top
+    let mut interval = 10;
+    loop {
+        match client.get_marco(interval + 10).await {
+            Ok(next) => {
+                interval = next.max(1);
+                if let Err(e) = client.send_polo().await {
+                    debug!("Heartbeat with {name} ended: {e}");
+                    break;
+                }
+            }
+            Err(IdeviceError::Heartbeat(HeartbeatError::Timeout)) => continue,
+            Err(e) => {
+                debug!("Heartbeat with {name} ended: {e}");
+                break;
+            }
+        }
+    }
+}
+
 /// Pick a device by UDID, name (case-insensitive), or, when there's only one, automatically.
 /// Among several transports for the same device, the best one wins.
 pub fn select<'a>(devices: &'a [Device], selector: Option<&str>) -> Result<&'a Device> {
@@ -413,6 +471,56 @@ mod tests {
             ip: None,
             usbmuxd_id: None,
         }
+    }
+
+    /// Write one length-prefixed XML plist, the way lockdownd services frame messages.
+    async fn send(stream: &mut tokio::io::DuplexStream, value: plist::Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut xml = Vec::new();
+        value.to_writer_xml(&mut xml).unwrap();
+        stream
+            .write_all(&(xml.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&xml).await.unwrap();
+    }
+
+    async fn recv(stream: &mut tokio::io::DuplexStream) -> plist::Value {
+        use tokio::io::AsyncReadExt;
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).await.unwrap();
+        plist::from_bytes(&buf).unwrap()
+    }
+
+    fn dict(key: &str, value: plist::Value) -> plist::Value {
+        let mut d = plist::Dictionary::new();
+        d.insert(key.into(), value);
+        plist::Value::Dictionary(d)
+    }
+
+    #[tokio::test]
+    async fn heartbeat_answers_marco_with_polo_until_sleep() {
+        let (host, mut phone) = tokio::io::duplex(4096);
+        let client = HeartbeatClient::new(Idevice::new(Box::new(host), "test"));
+        let task = tokio::spawn(keep_alive(client, "Phone".into()));
+
+        for _ in 0..3 {
+            send(&mut phone, dict("Interval", 1.into())).await;
+            let reply = recv(&mut phone).await;
+            let command = reply
+                .as_dictionary()
+                .and_then(|d| d.get("Command"))
+                .and_then(|c| c.as_string());
+            assert_eq!(command, Some("Polo"));
+        }
+        // Going to sleep ends the heartbeat
+        send(&mut phone, dict("Command", "SleepyTime".into())).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

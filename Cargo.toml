@@ -13,7 +13,7 @@ repository = "https://github.com/ksotox/sideward"
 sideward-core = { path = "crates/sideward-core" }
 # isideload carries the current Apple ID login fixes (Mac anisette + server-provided client info)
 isideload = { version = "=0.5.0", default-features = false, features = ["install", "fs-storage", "tokio-mt"] }
-idevice = { version = "0.1.68", default-features = false, features = ["ring", "usbmuxd", "tcp", "afc", "installation_proxy", "house_arrest", "pair", "mdns"] }
+idevice = { version = "0.1.68", default-features = false, features = ["ring", "usbmuxd", "tcp", "afc", "installation_proxy", "house_arrest", "pair", "mdns", "heartbeat"] }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "net", "sync", "fs", "signal"] }
 anyhow = "1"
 async-trait = "0.1"

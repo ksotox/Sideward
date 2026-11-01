@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use idevice::provider::IdeviceProvider;
+use idevice::{IdeviceService, provider::IdeviceProvider};
 use isideload::{dev::devices::DevicesApi, util::device::IdeviceInfo};
 use serde::Serialize;
 use tracing::{info, warn};
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::{
     ReportExt,
     account::Session,
-    device::Device,
+    device::{Device, Heartbeat},
     ipa::{self, AppInfo, AppOptions, PreparedApp},
     registry::{self, InstalledApp},
 };
@@ -51,6 +51,59 @@ pub struct InstallOutcome {
     pub installed_bundle_id: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub warnings: Vec<String>,
+}
+
+/// Wi-Fi transfers that drop are retried this many times in total.
+const WIFI_TRANSFER_ATTEMPTS: u32 = 3;
+
+async fn start_heartbeat(
+    device: &Device,
+    paths: &crate::paths::Paths,
+    progress: &ProgressFn,
+) -> Option<Heartbeat> {
+    match device.start_heartbeat(paths).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("No Wi-Fi heartbeat for {}: {e:#}", device.name);
+            progress(Progress::Warning(format!(
+                "Couldn't start the Wi-Fi keep-alive for {}; the transfer may drop: {e:#}",
+                device.name
+            )));
+            None
+        }
+    }
+}
+
+/// Errors that mean the connection to the device went away mid-operation.
+fn is_connection_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    [
+        "socket io failed",
+        "connection reset",
+        "broken pipe",
+        "connection aborted",
+        "timed out",
+        "unexpected eof",
+        "heartbeat",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
+}
+
+/// Remove a half-uploaded copy from the device's staging folder before uploading again.
+async fn clear_staging(provider: &crate::device::DeviceProvider, signed: &Path) {
+    let Some(name) = signed.file_name() else {
+        return;
+    };
+    let staged = format!("PublicStaging/{}", name.to_string_lossy());
+    match idevice::afc::AfcClient::connect(provider).await {
+        Ok(mut afc) => {
+            if let Err(e) = afc.remove_all(staged.as_str()).await {
+                tracing::debug!("Couldn't clear {staged}: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("Couldn't open AFC to clear {staged}: {e}"),
+    }
 }
 
 /// Expiry date from the provisioning profile embedded in a signed app.
@@ -151,7 +204,8 @@ impl Session {
         progress: &ProgressFn,
     ) -> Result<InstallOutcome> {
         progress(Progress::Step(format!("Connecting to {}", device.name)));
-        let provider = device.connect(&self.paths).await?;
+        let mut heartbeat = start_heartbeat(device, &self.paths, progress).await;
+        let mut provider = device.connect(&self.paths).await?;
         let device_info = IdeviceInfo::from_device(&provider)
             .await
             .anyhow()
@@ -183,13 +237,49 @@ impl Session {
         let expires_at = profile_expiry(&signed);
 
         progress(Progress::Step(format!("Installing on {}", device.name)));
-        let p = progress.clone();
-        isideload::sideload::install::install_app(&provider, &signed, move |pct| {
-            p(Progress::Fraction(pct as f32 / 100.0));
-        })
-        .await
-        .anyhow()
-        .context("Transferring the app to the device failed")?;
+        let mut attempt = 1;
+        loop {
+            let p = progress.clone();
+            let result =
+                isideload::sideload::install::install_app(&provider, &signed, move |pct| {
+                    p(Progress::Fraction(pct as f32 / 100.0));
+                })
+                .await
+                .anyhow();
+            let err = match result {
+                Ok(()) => break,
+                Err(e) => e,
+            };
+            let dropped = device.transport.is_wifi() && is_connection_error(&err);
+            if !dropped || attempt >= WIFI_TRANSFER_ATTEMPTS {
+                return Err(if dropped {
+                    err.context(format!(
+                        "Transferring the app over Wi-Fi failed because the connection kept dropping. \
+                         Keep {} unlocked and on the same Wi-Fi network as this computer, or use USB",
+                        device.name
+                    ))
+                } else {
+                    err.context("Transferring the app to the device failed")
+                });
+            }
+            attempt += 1;
+            warn!(
+                "Wi-Fi transfer to {} dropped: {err:#}; retrying",
+                device.name
+            );
+            progress(Progress::Warning(format!(
+                "The Wi-Fi connection to {} dropped; trying again ({attempt}/{WIFI_TRANSFER_ATTEMPTS})",
+                device.name
+            )));
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if !heartbeat.as_ref().is_some_and(|h| h.is_running()) {
+                heartbeat = start_heartbeat(device, &self.paths, progress).await;
+            }
+            provider = device.connect(&self.paths).await?;
+            clear_staging(&provider, &signed).await;
+            progress(Progress::Step(format!("Installing on {}", device.name)));
+        }
+        drop(heartbeat);
 
         Ok(InstallOutcome {
             installed_bundle_id: format!("{}.{}", prepared.info.bundle_id, self.team.team_id),
@@ -350,6 +440,14 @@ pub async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_dropped_connections() {
+        let dropped = anyhow::anyhow!("Failed to upload: device socket io failed");
+        assert!(is_connection_error(&dropped));
+        let other = anyhow::anyhow!("ApplicationVerificationFailed");
+        assert!(!is_connection_error(&other));
+    }
 
     #[test]
     fn reads_profile_expiry() {

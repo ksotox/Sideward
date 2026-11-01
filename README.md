@@ -115,6 +115,7 @@ sideward anisette list | sideward anisette set ani3.stikstore.app
 | `-22406` | Wrong Apple ID or password. Use your real password, not an app-specific one |
 | `-36607` | Apple is rate-limiting this login. Wait a few minutes |
 | "Could not reach usbmuxd" | Windows: install iTunes from apple.com. Linux: start `usbmuxd`. Wi-Fi direct still works |
+| Wi-Fi install fails with "device socket io failed" | The phone dropped the Wi-Fi connection. Sideward keeps it alive with iOS's heartbeat service and retries twice; if it still fails, keep the phone unlocked and on the same network, or use USB |
 | "This IPA is encrypted" | You have an App Store copy. Use a decrypted IPA |
 | Certificate limit | Pick one to revoke when asked, or pass `--auto-revoke` (it prefers Sideward's own old certificate) |
 
