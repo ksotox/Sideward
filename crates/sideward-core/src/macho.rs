@@ -245,6 +245,80 @@ fn build_path_command(
     buf
 }
 
+const LC_CODE_SIGNATURE: u32 = 0x1d;
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
+const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
+
+/// What `codesign -d` / `ldid -e` would report about a binary's signature.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct CodeSignature {
+    /// Signing identifier (usually the bundle id).
+    pub identifier: Option<String>,
+    pub team_id: Option<String>,
+    pub entitlements: Option<plist::Dictionary>,
+    /// False for ad-hoc / pseudo-signed binaries (no certificate).
+    pub has_certificate: bool,
+}
+
+/// Read the embedded code signature of the first slice, or `None` if unsigned.
+pub fn code_signature(data: &[u8]) -> Result<Option<CodeSignature>> {
+    let &(start, size) = slices(data)?
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Empty fat binary"))?;
+    let slice = &data[start..start + size];
+    let h = header(slice)?;
+    let Some((off, _, _)) = load_commands(slice, &h)?
+        .into_iter()
+        .find(|(_, cmd, _)| *cmd == LC_CODE_SIGNATURE)
+    else {
+        return Ok(None);
+    };
+    let sig_off = u32_le(slice, off + 8)? as usize;
+    let sig_len = u32_le(slice, off + 12)? as usize;
+    let Some(blob) = slice.get(sig_off..sig_off + sig_len) else {
+        bail!("Code signature points outside the binary");
+    };
+    if u32_be(blob, 0)? != CSMAGIC_EMBEDDED_SIGNATURE {
+        bail!("Unknown code signature format");
+    }
+    let mut sig = CodeSignature::default();
+    let count = u32_be(blob, 8)? as usize;
+    for i in 0..count {
+        let entry = 12 + i * 8;
+        let blob_off = u32_be(blob, entry + 4)? as usize;
+        let magic = u32_be(blob, blob_off)?;
+        let len = u32_be(blob, blob_off + 4)? as usize;
+        let Some(body) = blob.get(blob_off..blob_off + len) else {
+            continue;
+        };
+        match magic {
+            CSMAGIC_CODEDIRECTORY if sig.identifier.is_none() => {
+                let version = u32_be(body, 8)?;
+                let ident = u32_be(body, 20)? as usize;
+                sig.identifier = Some(c_string(body, ident, body.len()));
+                if version >= 0x20200 {
+                    let team = u32_be(body, 48)? as usize;
+                    if team != 0 {
+                        sig.team_id =
+                            Some(c_string(body, team, body.len())).filter(|t| !t.is_empty());
+                    }
+                }
+            }
+            CSMAGIC_EMBEDDED_ENTITLEMENTS => {
+                sig.entitlements = plist::Value::from_reader_xml(&body[8..])
+                    .ok()
+                    .and_then(plist::Value::into_dictionary);
+            }
+            // An empty wrapper (8-byte header only) means ad-hoc
+            CSMAGIC_BLOBWRAPPER => sig.has_certificate = len > 8,
+            _ => {}
+        }
+    }
+    Ok(Some(sig))
+}
+
 /// Add an `LC_LOAD_DYLIB` (or weak) command for `path` to every slice.
 /// Returns `false` if the binary already loads it.
 pub fn add_dylib(data: &mut [u8], path: &str, weak: bool) -> Result<bool> {
@@ -382,6 +456,104 @@ pub(crate) mod tests {
             out.extend_from_slice(s);
         }
         out
+    }
+
+    /// Append a code signature with a CodeDirectory, entitlements and an optional CMS blob.
+    pub(crate) fn with_signature(
+        mut d: Vec<u8>,
+        ident: &str,
+        team: &str,
+        ents: &str,
+        cms: bool,
+    ) -> Vec<u8> {
+        fn be(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_be_bytes());
+        }
+        // CodeDirectory v0x20200 with identifier and team strings right after an 88-byte header
+        let mut cd = Vec::new();
+        let ident_off = 88u32;
+        let team_off = ident_off + ident.len() as u32 + 1;
+        be(&mut cd, CSMAGIC_CODEDIRECTORY);
+        be(&mut cd, 0); // length, patched below
+        be(&mut cd, 0x20200);
+        be(&mut cd, 0);
+        be(&mut cd, 0);
+        be(&mut cd, ident_off);
+        cd.resize(48, 0);
+        be(&mut cd, team_off);
+        cd.resize(88, 0);
+        cd.extend_from_slice(ident.as_bytes());
+        cd.push(0);
+        cd.extend_from_slice(team.as_bytes());
+        cd.push(0);
+        let cd_len = cd.len() as u32;
+        cd[4..8].copy_from_slice(&cd_len.to_be_bytes());
+
+        let mut ent = Vec::new();
+        be(&mut ent, CSMAGIC_EMBEDDED_ENTITLEMENTS);
+        be(&mut ent, 8 + ents.len() as u32);
+        ent.extend_from_slice(ents.as_bytes());
+
+        let mut wrapper = Vec::new();
+        be(&mut wrapper, CSMAGIC_BLOBWRAPPER);
+        be(&mut wrapper, if cms { 12 } else { 8 });
+        if cms {
+            wrapper.extend_from_slice(&[1, 2, 3, 4]);
+        }
+
+        let blobs = [(0u32, cd), (5, ent), (0x10000, wrapper)];
+        let mut sb = Vec::new();
+        be(&mut sb, CSMAGIC_EMBEDDED_SIGNATURE);
+        be(&mut sb, 0);
+        be(&mut sb, blobs.len() as u32);
+        let mut offset = 12 + blobs.len() as u32 * 8;
+        for (kind, b) in &blobs {
+            be(&mut sb, *kind);
+            be(&mut sb, offset);
+            offset += b.len() as u32;
+        }
+        for (_, b) in &blobs {
+            sb.extend_from_slice(b);
+        }
+        let sb_len = sb.len() as u32;
+        sb[4..8].copy_from_slice(&sb_len.to_be_bytes());
+
+        let data_off = d.len() as u32;
+        d.extend_from_slice(&sb);
+        let mut cmd = vec![0u8; 16];
+        put_u32(&mut cmd, 0, LC_CODE_SIGNATURE);
+        put_u32(&mut cmd, 4, 16);
+        put_u32(&mut cmd, 8, data_off);
+        put_u32(&mut cmd, 12, sb_len);
+        insert_command(&mut d, &cmd).unwrap();
+        d
+    }
+
+    #[test]
+    fn reads_code_signature() {
+        let ents = r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>get-task-allow</key><true/></dict></plist>"#;
+        let signed = with_signature(
+            sample_macho(0),
+            "com.example.demo",
+            "ABCDE12345",
+            ents,
+            true,
+        );
+        let sig = code_signature(&signed).unwrap().unwrap();
+        assert_eq!(sig.identifier.as_deref(), Some("com.example.demo"));
+        assert_eq!(sig.team_id.as_deref(), Some("ABCDE12345"));
+        assert!(sig.has_certificate);
+        let e = sig.entitlements.unwrap();
+        assert_eq!(
+            e.get("get-task-allow").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+
+        let adhoc = with_signature(sample_macho(0), "x", "", ents, false);
+        let sig = code_signature(&adhoc).unwrap().unwrap();
+        assert!(!sig.has_certificate);
+        assert_eq!(sig.team_id, None);
+        assert_eq!(code_signature(&sample_macho(0)).unwrap(), None);
     }
 
     #[test]

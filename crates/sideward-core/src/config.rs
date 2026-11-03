@@ -30,6 +30,8 @@ pub struct Config {
     /// Desktop app: closing the window keeps Sideward running (tray on Windows/macOS) so it can
     /// re-sign apps when devices connect.
     pub run_in_background: bool,
+    /// AltStore/SideStore source URLs.
+    pub sources: Vec<String>,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             refresh_days_left: 3,
             launch_at_login: false,
             run_in_background: true,
+            sources: Vec::new(),
         }
     }
 }

@@ -25,6 +25,8 @@ use crate::worker::{self, Cmd, Event, PickKind, Prompt};
 enum Tab {
     Install,
     Apps,
+    Device,
+    Sources,
     Settings,
 }
 
@@ -162,6 +164,10 @@ pub struct SidewardApp {
     tray: Option<tray_icon::TrayIcon>,
     minimize_on_first_frame: bool,
     told_about_background: bool,
+
+    tools: crate::tools_ui::DeviceTools,
+    sources_ui: crate::tools_ui::SourcesUi,
+    confirm: Option<crate::tools_ui::Confirm>,
 }
 
 impl SidewardApp {
@@ -209,6 +215,9 @@ impl SidewardApp {
             tray,
             minimize_on_first_frame: false,
             told_about_background: false,
+            tools: Default::default(),
+            sources_ui: Default::default(),
+            confirm: None,
         };
         // Started at login: hidden in the tray, or minimized where there's no tray
         if launch.background {
@@ -281,6 +290,21 @@ impl SidewardApp {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Attention => show_window(ctx),
+                Event::DeviceDetails(d) => self.tools.details = Some(d),
+                Event::DeviceApps(apps) => self.tools.apps = Some(apps),
+                Event::Profiles(p) => self.tools.profiles = Some(p),
+                Event::CrashReports(c) => self.tools.crashes = Some(c),
+                Event::SyslogLines(lines) => self.tools.push_log(lines),
+                Event::SyslogStopped => self.tools.log_running = false,
+                Event::Sources {
+                    sources,
+                    errors,
+                    updates,
+                } => {
+                    self.sources_ui.sources = sources;
+                    self.sources_ui.errors = errors;
+                    self.sources_ui.updates = updates;
+                }
                 Event::SignedOut => {
                     self.logged_in = None;
                     self.has_saved_password = false;
@@ -374,6 +398,15 @@ impl SidewardApp {
                         PickKind::ExportTarget => {
                             if let Some(source) = self.app_path.clone() {
                                 self.send(Cmd::Export {
+                                    source,
+                                    options: self.options.to_options(),
+                                    out: path,
+                                });
+                            }
+                        }
+                        PickKind::AdhocExportTarget => {
+                            if let Some(source) = self.app_path.clone() {
+                                self.send(Cmd::ExportAdhoc {
                                     source,
                                     options: self.options.to_options(),
                                     out: path,
@@ -663,6 +696,13 @@ impl SidewardApp {
                 .clicked()
             {
                 self.send(Cmd::Pick(PickKind::ExportTarget));
+            }
+            if ui
+                .add_enabled(idle && app_ok, egui::Button::new("Pseudo-sign IPA…"))
+                .on_hover_text("Ad-hoc sign without an Apple ID (like ldid -S), keeping the app's entitlements. For TrollStore or jailbroken devices.")
+                .clicked()
+            {
+                self.send(Cmd::Pick(PickKind::AdhocExportTarget));
             }
         });
     }
@@ -1011,6 +1051,34 @@ impl SidewardApp {
     }
 }
 
+impl SidewardApp {
+    fn confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else { return };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("sideward-confirm")).show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            ui.label(&confirm.message);
+            ui.horizontal(|ui| {
+                if ui.button("Yes").clicked() {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                if let Some(c) = self.confirm.take() {
+                    self.send(c.cmd);
+                }
+            }
+            Some(false) => self.confirm = None,
+            None => {}
+        }
+    }
+}
+
 fn config_changed(a: &Config, b: &Config) -> bool {
     serde_json::to_value(a).ok() != serde_json::to_value(b).ok()
 }
@@ -1078,6 +1146,8 @@ impl eframe::App for SidewardApp {
                     Tab::Apps,
                     format!("My apps ({})", self.apps.len()),
                 );
+                ui.selectable_value(&mut self.tab, Tab::Device, "Device");
+                ui.selectable_value(&mut self.tab, Tab::Sources, "Sources");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
         });
@@ -1095,10 +1165,30 @@ impl eframe::App for SidewardApp {
                     self.app_section(ui);
                 }
                 Tab::Apps => self.apps_tab(ui),
+                Tab::Device => {
+                    let device = self.selected_device().cloned();
+                    let idle = self.busy.is_none();
+                    let (run, confirm) = self.tools.ui(ui, device.as_ref(), idle);
+                    if let Some(cmd) = run {
+                        self.send(cmd);
+                    }
+                    if confirm.is_some() {
+                        self.confirm = confirm;
+                    }
+                }
+                Tab::Sources => {
+                    let device = self.selected_device().cloned();
+                    let idle = self.busy.is_none();
+                    let urls = self.config.sources.clone();
+                    if let Some(cmd) = self.sources_ui.ui(ui, device.as_ref(), &urls, idle) {
+                        self.send(cmd);
+                    }
+                }
                 Tab::Settings => self.settings_tab(ui),
             });
         });
 
         self.prompt_modal(&ctx);
+        self.confirm_modal(&ctx);
     }
 }

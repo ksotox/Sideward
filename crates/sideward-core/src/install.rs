@@ -109,11 +109,7 @@ async fn clear_staging(provider: &crate::device::DeviceProvider, signed: &Path) 
 /// Expiry date from the provisioning profile embedded in a signed app.
 fn profile_expiry(app_dir: &Path) -> Option<DateTime<Utc>> {
     let data = std::fs::read(app_dir.join("embedded.mobileprovision")).ok()?;
-    let start = data.windows(5).position(|w| w == b"<?xml")?;
-    let end = data.windows(8).rposition(|w| w == b"</plist>")? + 8;
-    let value = plist::Value::from_reader_xml(&data[start..end]).ok()?;
-    let date = value.as_dictionary()?.get("ExpirationDate")?.as_date()?;
-    Some(std::time::SystemTime::from(date).into())
+    crate::provisioning::ProfileInfo::parse(&data)?.expires
 }
 
 async fn prepare_blocking(

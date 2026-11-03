@@ -22,8 +22,11 @@ use sideward_core::{
     device::{self, Device, DiscoverOptions},
     install::{self, InstallRequest, Progress, ProgressFn, RefreshFilter},
     ipa::{self, AppInfo, AppOptions},
+    provisioning::ProfileInfo,
     registry::{self, InstalledApp},
-    watch, wifi,
+    sign,
+    sources::{self, Source, SourceApp, SourceVersion},
+    tools, watch, wifi,
 };
 
 /// Log in again after this long; Apple's developer session tokens expire.
@@ -74,6 +77,49 @@ pub enum Cmd {
     ForgetApp(String),
     SaveConfig(Config),
     Pick(PickKind),
+    /// Ad-hoc (pseudo) sign for TrollStore / jailbroken devices; no Apple ID.
+    ExportAdhoc {
+        source: PathBuf,
+        options: AppOptions,
+        out: PathBuf,
+    },
+    // Device tools
+    DeviceDetails(Box<Device>),
+    DeviceApps {
+        device: Box<Device>,
+        system: bool,
+    },
+    UninstallApp {
+        device: Box<Device>,
+        bundle_id: String,
+    },
+    Power {
+        device: Box<Device>,
+        action: tools::Power,
+    },
+    Profiles(Box<Device>),
+    RemoveExpiredProfiles(Box<Device>),
+    CrashReports(Box<Device>),
+    SaveCrashReports {
+        device: Box<Device>,
+        names: Vec<String>,
+    },
+    StartSyslog {
+        device: Box<Device>,
+        filter: String,
+    },
+    StopSyslog,
+    // App sources
+    LoadSources,
+    AddSource(String),
+    RemoveSource(String),
+    InstallFromSource {
+        device: Box<Device>,
+        app: Box<SourceApp>,
+        version: SourceVersion,
+        /// Keep these options (an update of a remembered app).
+        options: AppOptions,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +127,7 @@ pub enum PickKind {
     App,
     Tweak,
     ExportTarget,
+    AdhocExportTarget,
 }
 
 pub enum Prompt {
@@ -98,6 +145,8 @@ pub enum Prompt {
     },
 }
 
+// Events are sent one at a time, so the big variant's size doesn't matter
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Log(String),
     Error(String),
@@ -120,6 +169,29 @@ pub enum Event {
     Apps(Vec<InstalledApp>),
     Prompt(Prompt),
     Picked(PickKind, Option<PathBuf>),
+    DeviceDetails(tools::DeviceDetails),
+    DeviceApps(Vec<tools::DeviceApp>),
+    Profiles(Vec<ProfileInfo>),
+    CrashReports(Vec<String>),
+    SyslogLines(Vec<String>),
+    SyslogStopped,
+    Sources {
+        sources: Vec<Source>,
+        errors: Vec<String>,
+        /// (remembered app key, app name, device name, new version)
+        updates: Vec<SourceUpdate>,
+    },
+}
+
+#[derive(Clone)]
+pub struct SourceUpdate {
+    pub name: String,
+    pub device_udid: String,
+    pub device_name: String,
+    pub current: Option<String>,
+    pub app: SourceApp,
+    pub version: SourceVersion,
+    pub options: AppOptions,
 }
 
 #[derive(Clone)]
@@ -200,6 +272,7 @@ struct Worker {
     /// For background tasks (device watcher, periodic check) to queue work.
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     failed_at: HashMap<String, Instant>,
+    syslog: Option<tokio::task::AbortHandle>,
 }
 
 impl Worker {
@@ -212,6 +285,7 @@ impl Worker {
             out,
             cmd_tx,
             failed_at: HashMap::new(),
+            syslog: None,
         }
     }
 
@@ -327,8 +401,17 @@ impl Worker {
                 tokio::spawn(async move { out.send(Event::Picked(kind, pick(kind).await)) });
                 continue;
             }
+            if matches!(cmd, Cmd::StartSyslog { .. } | Cmd::StopSyslog) {
+                self.toggle_syslog(cmd).await;
+                continue;
+            }
             let label = match &cmd {
                 Cmd::Login { .. } => Some("Signing in"),
+                Cmd::ExportAdhoc { .. } => Some("Pseudo-signing"),
+                Cmd::UninstallApp { .. } => Some("Uninstalling"),
+                Cmd::InstallFromSource { .. } => Some("Installing from source"),
+                Cmd::SaveCrashReports { .. } => Some("Saving crash reports"),
+                Cmd::LoadSources | Cmd::AddSource(_) => Some("Loading sources"),
                 Cmd::Install { .. } => Some("Installing"),
                 Cmd::Export { .. } => Some("Exporting"),
                 Cmd::Refresh { .. } => Some("Refreshing apps"),
@@ -616,8 +699,211 @@ impl Worker {
                 self.send_config();
             }
             Cmd::Pick(_) => unreachable!("handled in run"),
+            Cmd::StartSyslog { .. } | Cmd::StopSyslog => unreachable!("handled in run"),
+            Cmd::ExportAdhoc {
+                source,
+                options,
+                out,
+            } => {
+                let paths = self.paths.clone();
+                let dest = out.clone();
+                let (info, warnings) = tokio::task::spawn_blocking(move || {
+                    sign::export_adhoc(&paths, &source, &options, None, &dest)
+                })
+                .await??;
+                for w in warnings {
+                    self.out.send(Event::Error(format!("Warning: {w}")));
+                }
+                self.out.send(Event::Log(format!(
+                    "Pseudo-signed {} to {} (for TrollStore or jailbroken devices)",
+                    info.name,
+                    out.display()
+                )));
+            }
+            Cmd::DeviceDetails(device) => {
+                let provider = device.connect(&self.paths).await?;
+                self.out
+                    .send(Event::DeviceDetails(tools::details(&provider).await?));
+            }
+            Cmd::DeviceApps { device, system } => {
+                let provider = device.connect(&self.paths).await?;
+                self.out.send(Event::DeviceApps(
+                    tools::list_apps(&provider, system).await?,
+                ));
+            }
+            Cmd::UninstallApp { device, bundle_id } => {
+                let provider = device.connect(&self.paths).await?;
+                tools::uninstall_app(&provider, &bundle_id).await?;
+                registry::remove(&self.paths, &format!("{bundle_id}@{}", device.udid))?;
+                self.out.send(Event::Log(format!(
+                    "Uninstalled {bundle_id} from {}",
+                    device.name
+                )));
+                self.send_apps();
+                self.out
+                    .send(Event::DeviceApps(tools::list_apps(&provider, false).await?));
+            }
+            Cmd::Power { device, action } => {
+                let provider = device.connect(&self.paths).await?;
+                tools::power(&provider, action).await?;
+                let what = match action {
+                    tools::Power::Restart => "Restarting",
+                    tools::Power::Shutdown => "Shutting down",
+                    tools::Power::Sleep => "Putting to sleep",
+                };
+                self.out.send(Event::Log(format!("{what} {}", device.name)));
+            }
+            Cmd::Profiles(device) => {
+                let provider = device.connect(&self.paths).await?;
+                self.out
+                    .send(Event::Profiles(tools::installed_profiles(&provider).await?));
+            }
+            Cmd::RemoveExpiredProfiles(device) => {
+                let provider = device.connect(&self.paths).await?;
+                let removed = tools::remove_expired_profiles(&provider).await?;
+                self.out.send(Event::Log(format!(
+                    "Removed {} expired profile(s) from {}",
+                    removed.len(),
+                    device.name
+                )));
+                self.out
+                    .send(Event::Profiles(tools::installed_profiles(&provider).await?));
+            }
+            Cmd::CrashReports(device) => {
+                let provider = device.connect(&self.paths).await?;
+                self.out
+                    .send(Event::CrashReports(tools::crash_reports(&provider).await?));
+            }
+            Cmd::SaveCrashReports { device, names } => {
+                let provider = device.connect(&self.paths).await?;
+                let dir = directories::UserDirs::new()
+                    .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| self.paths.root().to_path_buf())
+                    .join("Sideward crash reports");
+                std::fs::create_dir_all(&dir)?;
+                for name in &names {
+                    let data = tools::pull_crash_report(&provider, name).await?;
+                    std::fs::write(dir.join(name), data)?;
+                }
+                self.out.send(Event::Log(format!(
+                    "Saved {} crash report(s) to {}",
+                    names.len(),
+                    dir.display()
+                )));
+            }
+            Cmd::LoadSources => self.load_sources().await,
+            Cmd::AddSource(url) => {
+                let source = sources::fetch(url.trim()).await?;
+                if !self.config.sources.iter().any(|u| u == url.trim()) {
+                    self.config.sources.push(url.trim().to_string());
+                    self.config.save(&self.paths)?;
+                    self.send_config();
+                }
+                self.out.send(Event::Log(format!(
+                    "Added {} ({} apps)",
+                    source.name,
+                    source.apps.len()
+                )));
+                self.load_sources().await;
+            }
+            Cmd::RemoveSource(url) => {
+                self.config.sources.retain(|u| u != &url);
+                self.config.save(&self.paths)?;
+                self.send_config();
+                self.load_sources().await;
+            }
+            Cmd::InstallFromSource {
+                device,
+                app,
+                version,
+                options,
+            } => {
+                let ipa = sources::download(&self.paths, &app, &version, self.progress()).await?;
+                let progress = self.progress();
+                let session = self.ensure_session().await?;
+                let request = InstallRequest {
+                    source: ipa,
+                    options,
+                    remember: true,
+                };
+                let outcome = session.install(&device, &request, progress).await?;
+                self.out.send(Event::Log(format!(
+                    "Installed {} {} on {}",
+                    outcome.app.name, version.version, device.name
+                )));
+                self.send_apps();
+                self.load_sources().await;
+            }
         }
         Ok(())
+    }
+
+    async fn load_sources(&mut self) {
+        let (loaded, failed) = sources::fetch_all(&self.config.sources).await;
+        let installed = registry::list(&self.paths).unwrap_or_default();
+        let updates = sources::updates(&installed, &loaded)
+            .into_iter()
+            .map(|u| SourceUpdate {
+                name: u.installed.name.clone(),
+                device_udid: u.installed.udid.clone(),
+                device_name: u.installed.device_name.clone(),
+                current: u.installed.version.clone(),
+                app: u.app,
+                version: u.version,
+                options: u.installed.options,
+            })
+            .collect();
+        self.out.send(Event::Sources {
+            sources: loaded,
+            errors: failed
+                .into_iter()
+                .map(|(url, e)| format!("{url}: {e:#}"))
+                .collect(),
+            updates,
+        });
+    }
+
+    /// Live log runs beside other work; lines are batched so a chatty device doesn't flood
+    /// the window with repaints.
+    async fn toggle_syslog(&mut self, cmd: Cmd) {
+        if let Some(handle) = self.syslog.take() {
+            handle.abort();
+        }
+        let Cmd::StartSyslog { device, filter } = cmd else {
+            self.out.send(Event::SyslogStopped);
+            return;
+        };
+        let paths = self.paths.clone();
+        let out = self.out.clone();
+        let task = tokio::spawn(async move {
+            let result: Result<()> = async {
+                let provider = device.connect(&paths).await?;
+                let mut log = tools::Syslog::open(&provider).await?;
+                let mut batch = Vec::new();
+                let mut flush = tokio::time::interval(Duration::from_millis(250));
+                loop {
+                    tokio::select! {
+                        line = log.next_line() => {
+                            let line = line?;
+                            if tools::log_matches(&line, &filter) {
+                                batch.push(line.trim_end().to_string());
+                            }
+                        }
+                        _ = flush.tick() => {
+                            if !batch.is_empty() {
+                                out.send(Event::SyslogLines(std::mem::take(&mut batch)));
+                            }
+                        }
+                    }
+                }
+            }
+            .await;
+            if let Err(e) = result {
+                out.send(Event::Error(format!("Live log stopped: {e:#}")));
+            }
+            out.send(Event::SyslogStopped);
+        });
+        self.syslog = Some(task.abort_handle());
     }
 }
 
@@ -640,6 +926,13 @@ async fn pick(kind: PickKind) -> Option<PathBuf> {
             dialog
                 .add_filter("iOS app", &["ipa"])
                 .set_file_name("signed.ipa")
+                .save_file()
+                .await
+        }
+        PickKind::AdhocExportTarget => {
+            dialog
+                .add_filter("iOS app", &["ipa", "tipa"])
+                .set_file_name("pseudo-signed.tipa")
                 .save_file()
                 .await
         }

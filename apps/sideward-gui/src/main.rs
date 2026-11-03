@@ -2,6 +2,7 @@
 
 mod app;
 mod system;
+mod tools_ui;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
 mod worker;

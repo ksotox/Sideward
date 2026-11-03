@@ -11,6 +11,9 @@ Sideward ships as a desktop app (`sideward-gui`) and a command-line tool (`sidew
 - **AutoRefresh when a device connects.** Free Apple IDs sign apps for 7 days. Sideward remembers what it installed, keeping a copy of the IPA and any tweaks. Whenever a device is plugged in or shows up on Wi-Fi, it re-signs that device's apps before the 7 days run out, and the apps keep their data. You can turn this on or off per app, like Sideloadly's AutoRefresh.
 - **Starts with your computer and stays signed in.** Sideward can launch at login and wait in the tray (minimized on Linux), and it keeps you signed in until your Apple ID password changes or Apple asks you to sign in again.
 - **Sideloadly's advanced options:** change name, bundle ID, version, or minimum iOS; enable file sharing; remove device restrictions, extensions, or the Watch app; inject tweaks (`.dylib`, `.framework`, `.bundle`, rootful or rootless `.deb`).
+- **AltStore-style sources.** Add AltStore/SideStore source URLs, browse their apps, install with one click, and see when an installed app has an update.
+- **Device tools built in** (what you'd otherwise use libimobiledevice, ideviceinstaller and ios-deploy for): device info, installed apps and uninstall, a live device log, crash reports, on-device provisioning profiles, copying files in and out of an app, restart/shut down/sleep. All of it works over USB or Wi-Fi.
+- **Pseudo-signing like `ldid`.** Ad-hoc sign an IPA without an Apple ID, keeping or replacing its entitlements, for TrollStore or jailbroken devices. `inspect` shows an IPA's signature, entitlements and provisioning profile like `codesign -d`.
 - **Safety checks.** It refuses encrypted App Store IPAs up front, and when your account hits its certificate limit it asks which certificate to revoke.
 
 ## Install
@@ -40,6 +43,9 @@ Run `sideward-gui`, sign in, pick a device, and drop an `.ipa` onto the window. 
 - On Windows and macOS, closing the window keeps Sideward running in the tray so AutoRefresh keeps working. Right-click the tray icon for **Re-sign apps now** or **Quit Sideward**. You can turn this off in Settings. Linux has no tray: started at login, Sideward opens minimized, and closing the window quits.
 - **Stay signed in** is on by default: the password goes to the OS keychain after the first successful sign-in, and Sideward signs in by itself at startup. If Apple rejects the saved password (it was changed) or asks for a 2FA code, the window pops up and asks. **Sign out** forgets the password.
 - Only one copy runs at a time; opening Sideward again brings the running window forward.
+- **Device** shows the selected device's model, iOS version, battery, storage, and whether Developer Mode is on (sideloaded apps won't open without it). It also has **Installed apps** (with Uninstall), **Provisioning profiles** (with **Remove expired**), **Crash reports** (filter by app, save to Downloads), a **Live log** with a text filter, and Restart / Shut down / Sleep.
+- **Sources** adds AltStore/SideStore source URLs, lists their apps with **Install** buttons, and shows **Updates** for apps you installed through Sideward.
+- **Pseudo-sign IPA…** on the Install tab writes an ad-hoc signed `.tipa` for TrollStore.
 
 ## Command line
 
@@ -99,6 +105,43 @@ The daemon watches for devices plugging in over USB (instantly) and saved Wi-Fi 
 
 Apps installed with Sideloadly itself can't be re-signed, because Sideward needs the original IPA. Install them once with Sideward and they're tracked from then on.
 
+### Device tools
+
+Like libimobiledevice, ideviceinstaller and ios-deploy. Each takes `-d <device>`, `--usb`, `--wifi` or `--ip` like `install` does:
+
+```sh
+sideward device info                          # model, iOS, battery, storage, Developer Mode
+sideward device apps [--system]               # installed apps; marks the sideloaded ones
+sideward device uninstall com.example.app
+sideward device syslog --filter YouTube       # live log, filtered (Ctrl+C to stop)
+sideward device crashes --app YouTube --save ./crashes
+sideward device profiles list | remove <uuid> | clean    # clean = remove expired
+sideward device files ls <bundle-id> [path]   # an app's container (development-signed) or Documents
+sideward device files pull <bundle-id> /Documents --to ./backup
+sideward device files push <bundle-id> ./save.dat [--to /Documents]
+sideward device restart | shutdown | sleep
+```
+
+### Sources (AltStore / SideStore)
+
+```sh
+sideward source add https://apps.sidestore.io
+sideward source apps [--search delta]
+sideward source install SideStore             # name or bundle id; downloads, signs, installs
+sideward source updates [--install]           # newer versions of apps you installed
+```
+
+### Signing without an Apple ID (ldid / codesign)
+
+```sh
+sideward inspect App.ipa                      # signature, team, entitlements, embedded profile
+sideward inspect --entitlements App.ipa       # entitlements as XML, like `ldid -e`
+sideward export App.ipa -o App.tipa --adhoc   # pseudo-sign (ldid -S), keeping the app's entitlements
+sideward export App.ipa -o App.tipa --adhoc --entitlements ents.plist
+```
+
+Ad-hoc signed apps install with TrollStore or on jailbroken devices; stock iOS needs an Apple ID signature (`install` / `export` without `--adhoc`). All the app changes (`--inject`, `--name`, ...) work with `--adhoc` too.
+
 ### Account housekeeping
 
 ```sh
@@ -116,6 +159,8 @@ sideward anisette list | sideward anisette set ani3.stikstore.app
 | `-36607` | Apple is rate-limiting this login. Wait a few minutes |
 | "Could not reach usbmuxd" | Windows: install iTunes from apple.com. Linux: start `usbmuxd`. Wi-Fi direct still works |
 | Wi-Fi install fails with "device socket io failed" | The phone dropped the Wi-Fi connection. Sideward keeps it alive with iOS's heartbeat service and retries twice; if it still fails, keep the phone unlocked and on the same network, or use USB |
+| Sideloaded app won't open (iOS 16+) | Turn on Settings → Privacy & Security → Developer Mode. `sideward device info` tells you if it's off |
+| App crashes on launch | `sideward device crashes --app <name>` or **Device → Crash reports**; a tweak missing CydiaSubstrate is a common cause |
 | "This IPA is encrypted" | You have an App Store copy. Use a decrypted IPA |
 | Certificate limit | Pick one to revoke when asked, or pass `--auto-revoke` (it prefers Sideward's own old certificate) |
 
