@@ -35,6 +35,8 @@ lzma-rs = "0.3"
 zstd = "0.13"
 walkdir = "2"
 futures-util = "0.3"
+apple-codesign-quick = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "gzip", "http2", "rustls-no-provider", "system-proxy"] }
 keyring = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust", "vendored"] }
 
 [dev-dependencies]

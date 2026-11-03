@@ -1,4 +1,5 @@
 mod prompt;
+mod tools_cmd;
 
 use std::{
     collections::HashMap,
@@ -19,7 +20,7 @@ use sideward_core::{
     install::{self, InstallRequest, Progress, ProgressFn, RefreshFilter},
     ipa::{self, AppOptions},
     registry::{self, RefreshPolicy},
-    watch, wifi,
+    sign, watch, wifi,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -77,13 +78,24 @@ enum Command {
         /// Output .ipa path
         #[arg(short, long)]
         output: PathBuf,
+        /// Pseudo-sign without an Apple ID (like `ldid -S`), for TrollStore or jailbroken devices
+        #[arg(long)]
+        adhoc: bool,
+        /// Entitlements plist for the main app (with --adhoc)
+        #[arg(long, requires = "adhoc", value_name = "PLIST")]
+        entitlements: Option<PathBuf>,
         #[command(flatten)]
         options: AppOptionArgs,
         #[command(flatten)]
         account: AccountArgs,
     },
     /// Show what's inside an IPA (no login needed)
-    Inspect { ipa: PathBuf },
+    Inspect {
+        ipa: PathBuf,
+        /// Print the main executable's entitlements as XML (like `ldid -e`)
+        #[arg(long)]
+        entitlements: bool,
+    },
     /// Sign in. You stay signed in (password in the OS keychain) until the password
     /// changes, Apple asks you to sign in again, or you run `logout`
     Login {
@@ -134,6 +146,11 @@ enum Command {
     /// Anisette servers used for Apple ID login
     #[command(subcommand)]
     Anisette(AnisetteCommand),
+    /// Device tools: info, installed apps, logs, crash reports, profiles, app files, power
+    Device(tools_cmd::DeviceCmd),
+    /// AltStore/SideStore app sources: browse, install, update
+    #[command(subcommand)]
+    Source(tools_cmd::SourceCommand),
 }
 
 #[derive(Subcommand)]
@@ -244,6 +261,16 @@ struct TransportArgs {
     /// Seconds to listen for Wi-Fi devices on the network
     #[arg(long, default_value_t = 3)]
     wifi_timeout: u64,
+}
+
+impl Default for TransportArgs {
+    fn default() -> Self {
+        Self {
+            usb: false,
+            wifi: false,
+            wifi_timeout: 3,
+        }
+    }
 }
 
 impl TransportArgs {
@@ -450,10 +477,28 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Export {
             ipa,
             output,
+            adhoc,
+            entitlements,
             options,
             account,
         } => {
             let options = options.to_options()?;
+            if adhoc {
+                let paths = ctx.paths.clone();
+                let out = output.clone();
+                let (info, warnings) = tokio::task::spawn_blocking(move || {
+                    sign::export_adhoc(&paths, &ipa, &options, entitlements.as_deref(), &out)
+                })
+                .await??;
+                for w in warnings {
+                    eprintln!("Warning: {w}");
+                }
+                println!("Pseudo-signed {} -> {}", info.name, output.display());
+                println!(
+                    "Install it with TrollStore or on a jailbroken device; stock iOS won't accept it."
+                );
+                return Ok(());
+            }
             let mut session = login(&mut ctx, &account, true).await?;
             let progress = ProgressUi::new();
             let outcome = session
@@ -469,8 +514,19 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Command::Inspect { ipa } => {
+        Command::Inspect { ipa, entitlements } => {
             let info = ipa::inspect(&ipa)?;
+            if entitlements {
+                let ents = info
+                    .signature
+                    .as_ref()
+                    .and_then(|s| s.entitlements.clone())
+                    .unwrap_or_default();
+                let mut xml = Vec::new();
+                plist::Value::Dictionary(ents).to_writer_xml(&mut xml)?;
+                println!("{}", String::from_utf8_lossy(&xml));
+                return Ok(());
+            }
             if ctx.json {
                 println!("{}", serde_json::to_string_pretty(&info)?);
                 return Ok(());
@@ -503,6 +559,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "no"
                 }
             );
+            tools_cmd::print_signature(&info);
             Ok(())
         }
         Command::Login { account } => {
@@ -590,6 +647,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Anisette(cmd) => cmd_anisette(&mut ctx, cmd),
+        Command::Device(cmd) => tools_cmd::device(&ctx, cmd).await,
+        Command::Source(cmd) => tools_cmd::source(&mut ctx, cmd).await,
     }
 }
 

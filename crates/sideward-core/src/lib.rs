@@ -17,7 +17,11 @@ pub mod install;
 pub mod ipa;
 pub mod macho;
 pub mod paths;
+pub mod provisioning;
 pub mod registry;
+pub mod sign;
+pub mod sources;
+pub mod tools;
 pub mod watch;
 pub mod wifi;
 

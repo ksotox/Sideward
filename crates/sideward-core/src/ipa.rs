@@ -49,6 +49,10 @@ pub struct AppInfo {
     pub extensions: Vec<String>,
     pub has_watch_app: bool,
     pub encrypted: bool,
+    /// The main executable's code signature (`codesign -d` / `ldid -e`), if signed.
+    pub signature: Option<macho::CodeSignature>,
+    /// The embedded provisioning profile, if any.
+    pub profile: Option<crate::provisioning::ProfileInfo>,
 }
 
 pub struct PreparedApp {
@@ -86,6 +90,8 @@ fn app_info_from_plist(dict: &Dictionary) -> Result<AppInfo> {
         extensions: Vec::new(),
         has_watch_app: false,
         encrypted: false,
+        signature: None,
+        profile: None,
     })
 }
 
@@ -135,7 +141,12 @@ pub fn inspect(ipa: &Path) -> Result<AppInfo> {
     let mut exe = Vec::new();
     if let Ok(mut f) = zip.by_name(&format!("{app_prefix}{}", info.executable)) {
         f.read_to_end(&mut exe)?;
-        info.encrypted = macho::is_macho(&exe) && macho::is_encrypted(&exe).unwrap_or(false);
+        read_binary_details(&mut info, &exe);
+    }
+    let mut profile = Vec::new();
+    if let Ok(mut f) = zip.by_name(&format!("{app_prefix}embedded.mobileprovision")) {
+        f.read_to_end(&mut profile)?;
+        info.profile = crate::provisioning::ProfileInfo::parse(&profile);
     }
     Ok(info)
 }
@@ -155,9 +166,19 @@ fn inspect_app_dir(app_dir: &Path) -> Result<AppInfo> {
     }
     info.has_watch_app = app_dir.join("Watch").is_dir();
     if let Ok(exe) = fs::read(app_dir.join(&info.executable)) {
-        info.encrypted = macho::is_macho(&exe) && macho::is_encrypted(&exe).unwrap_or(false);
+        read_binary_details(&mut info, &exe);
+    }
+    if let Ok(profile) = fs::read(app_dir.join("embedded.mobileprovision")) {
+        info.profile = crate::provisioning::ProfileInfo::parse(&profile);
     }
     Ok(info)
+}
+
+fn read_binary_details(info: &mut AppInfo, exe: &[u8]) {
+    if macho::is_macho(exe) {
+        info.encrypted = macho::is_encrypted(exe).unwrap_or(false);
+        info.signature = macho::code_signature(exe).ok().flatten();
+    }
 }
 
 fn read_plist_dict(path: &Path) -> Result<Dictionary> {
